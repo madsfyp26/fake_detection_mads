@@ -37,3 +37,4 @@ audios/fake/FOR_REREC.wav filter=lfs diff=lfs merge=lfs -text
 audios/fake/InTheWild.wav filter=lfs diff=lfs merge=lfs -text
 audios/real/FOR_REREC.wav filter=lfs diff=lfs merge=lfs -text
 audios/real/InTheWild.wav filter=lfs diff=lfs merge=lfs -text
+model/noma-1 filter=lfs diff=lfs merge=lfs -text
