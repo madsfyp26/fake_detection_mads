@@ -1,0 +1,37 @@
+{
+  "avh_fusion_ckpt": {
+    "mtime": 1773259006.2326248,
+    "path": "/Users/soham/fake-audio-detection/AVH/checkpoints/AVH-Align_AV1M.pt",
+    "sha256": "71f7b4fdfe153a2ed7f8a4f2fa552662af3909aa009c80f089f8aa0cc45eda85",
+    "size": 20905434,
+    "verified_at": 1774973820
+  },
+  "avhubert_ckpt": {
+    "mtime": 1773258477.2260091,
+    "path": "/Users/soham/fake-audio-detection/AVH/av_hubert/avhubert/self_large_vox_433h.pt",
+    "sha256": null,
+    "size": 5728780791,
+    "verified_at": 1774973820
+  },
+  "dlib_face_predictor": {
+    "mtime": 1773249929.0,
+    "path": "/Users/soham/fake-audio-detection/AVH/av_hubert/avhubert/content/data/misc/shape_predictor_68_face_landmarks.dat",
+    "sha256": "fbdc2cb80eb9aa7a758672cbfdda32ba6300efe9b6e6c7a299ff7e736b11b92f",
+    "size": 99693937,
+    "verified_at": 1774973820
+  },
+  "mean_face": {
+    "mtime": 1773249932.8565595,
+    "path": "/Users/soham/fake-audio-detection/AVH/av_hubert/avhubert/content/data/misc/20words_mean_face.npy",
+    "sha256": "dbf68b2044171e1160716df7c53e8bbfaa0ee8c61fb41171d04cb6092bb81422",
+    "size": 1168,
+    "verified_at": 1774973820
+  },
+  "noma_model": {
+    "mtime": 1773246657.4571762,
+    "path": "/Users/soham/fake-audio-detection/model/noma-1",
+    "sha256": "6c0b3332f7da0f16d30aab3ba5faa6c1588adbca78f7b457d37f3974c4e97bcd",
+    "size": 11858620,
+    "verified_at": 1774973820
+  }
+}
