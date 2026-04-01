@@ -5,7 +5,15 @@ import tempfile
 from functools import lru_cache
 from typing import Any
 
-from config import PROJECT_ROOT, AVH_DIR, AVH_GRADCAM_SCRIPT, AVH_FUSION_CKPT, AVH_AVHUBERT_CKPT
+from config import (
+    PROJECT_ROOT,
+    AVH_DIR,
+    AVH_GRADCAM_SCRIPT,
+    AVH_FUSION_CKPT,
+    AVH_AVHUBERT_CKPT,
+    GRADCAM_DEFAULT_MAX_FUSION_FRAMES,
+    GRADCAM_DEFAULT_REGION_TRACK_STRIDE,
+)
 from logging_utils import get_logger, log_timed
 from metrics import inc_counter
 
@@ -39,6 +47,64 @@ def _sha256_file_cached(path: str) -> str:
     return h.hexdigest()
 
 
+def normalize_cam_volume(cam_like: Any) -> tuple[Any | None, str | None]:
+    import numpy as np
+
+    cam = np.asarray(cam_like)
+    cam = np.squeeze(cam)
+    if cam.ndim != 3:
+        return None, f"bad_cam_shape:{tuple(cam.shape)}"
+    return cam, None
+
+
+def resize_frames_to_cam(frames_gray: Any, target_h: int, target_w: int):
+    import cv2 as _cv2
+    import numpy as np
+
+    T = int(frames_gray.shape[0])
+    out = np.zeros((T, target_h, target_w), dtype=frames_gray.dtype)
+    for t in range(T):
+        out[t] = _cv2.resize(frames_gray[t], (target_w, target_h), interpolation=_cv2.INTER_AREA)
+    return out
+
+
+def compute_windowed_fusion(cam: Any, frames_gray: Any, window_size: int):
+    import numpy as np
+    from explainability.video_fusion import (
+        compute_optical_flow_error,
+        compute_frequency_noise_map,
+        generate_fused_heatmap,
+    )
+
+    T_use = min(int(cam.shape[0]), int(frames_gray.shape[0]))
+    cam_use = cam[:T_use]
+    frames_use = frames_gray[:T_use]
+
+    if T_use <= 0:
+        raise ValueError("empty inputs after alignment")
+
+    Hc, Wc = int(cam_use.shape[1]), int(cam_use.shape[2])
+    frames_resized = resize_frames_to_cam(frames_use, Hc, Wc)
+
+    fused_chunks = []
+    hfe_vals = []
+    for start in range(0, T_use, window_size):
+        end = min(start + window_size, T_use)
+        cam_w = cam_use[start:end].astype(float)
+        frm_w = frames_resized[start:end]
+        flow_err = compute_optical_flow_error(frm_w)
+        freq_noise = compute_frequency_noise_map(frm_w)
+        fused_w = generate_fused_heatmap(cam_w, flow_err[: cam_w.shape[0]], freq_noise[: cam_w.shape[0]])
+        fused_chunks.append(fused_w)
+
+        # Frequency summary without importing scipy-heavy module in callers.
+        high_freq = freq_noise.mean(axis=(1, 2))
+        hfe_vals.extend([float(v) for v in high_freq])
+
+    fused = np.concatenate(fused_chunks, axis=0)
+    return fused, {"high_freq_energy": hfe_vals}
+
+
 def run_gradcam_mouth_roi(
     video_path: str,
     python_exe: str,
@@ -46,6 +112,10 @@ def run_gradcam_mouth_roi(
     adv_ckpt: str | None = None,
     roi_path: str | None = None,
     audio_path: str | None = None,
+    max_fusion_frames: int = GRADCAM_DEFAULT_MAX_FUSION_FRAMES,
+    region_track_stride: int = GRADCAM_DEFAULT_REGION_TRACK_STRIDE,
+    selection_mode: str = "top_k",
+    min_temporal_gap: int = 24,
     timeout: int = 300,
     keep_temp: bool = False,
     capture_attention: bool = False,
@@ -86,7 +156,9 @@ def run_gradcam_mouth_roi(
 
     cache_key = (
         f"video={video_hash}|fusion={fusion_hash}|avhubert={avhubert_hash}|roi={roi_hash}|audio={audio_hash}|"
-        f"adv={adv_hash}|topk={int(top_k)}|cap_attn={bool(capture_attention)}"
+        f"adv={adv_hash}|topk={int(top_k)}|cap_attn={bool(capture_attention)}|"
+        f"max_fusion={int(max_fusion_frames)}|track_stride={int(region_track_stride)}|"
+        f"sel_mode={selection_mode}|min_gap={int(min_temporal_gap)}"
     )
     cache_key_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
     cache_dir = os.path.join(cache_root, cache_key_hash)
@@ -144,6 +216,12 @@ def run_gradcam_mouth_roi(
             out_dir,
             "--top_k",
             str(int(top_k)),
+            "--selection_mode",
+            str(selection_mode),
+            "--min_temporal_gap",
+            str(int(min_temporal_gap)),
+            "--max_fusion_frames",
+            str(int(max_fusion_frames)),
             "--overwrite",
             "--device",
             "cpu",
@@ -179,6 +257,10 @@ def run_gradcam_mouth_roi(
         with open(index_path, "r", encoding="utf-8") as f:
             idx = json.load(f)
         idx.setdefault("xai_status", {})
+        idx.setdefault("max_fusion_frames", int(max_fusion_frames))
+        idx.setdefault("region_track_stride", int(region_track_stride))
+        idx.setdefault("selection_mode", str(selection_mode))
+        idx.setdefault("min_temporal_gap", int(min_temporal_gap))
 
         # Optional: compute temporal inconsistency, region tracks, and fused heatmaps
         # if CAM volume and video are available.
@@ -189,84 +271,76 @@ def run_gradcam_mouth_roi(
             import numpy as np
             from explainability.video_temporal import compute_temporal_inconsistency
             from explainability.video_regions import cam_to_binary_masks, track_regions_iou, summarize_region_anomalies
-            from explainability.video_fusion import (
-                prepare_gray_frames_from_video,
-                compute_optical_flow_error,
-                compute_frequency_noise_map,
-                generate_fused_heatmap,
-            )
-            from explainability.video_frequency import compute_frame_spectrum_stats
+            from explainability.video_fusion import prepare_gray_frames_from_video
 
-            cam = np.load(cam_volume_path)  # expected shape (T, H, W)
-
-            # Temporal inconsistency
-            try:
-                flat = cam.reshape(cam.shape[0], -1)
-                delta_t = compute_temporal_inconsistency(flat)
-                idx["temporal_inconsistency"] = delta_t.tolist()
-                idx["xai_status"]["temporal_inconsistency"] = "computed"
-            except Exception as e:
-                idx["xai_status"]["temporal_inconsistency"] = "failed"
-                idx["xai_errors"]["temporal_inconsistency"] = str(e)
-                logger.exception("temporal inconsistency enrichment failed")
-
-            # Region tracks
-            try:
-                masks = cam_to_binary_masks(cam)
-                tracks = track_regions_iou(masks, cam)
-                idx["region_tracks"] = summarize_region_anomalies(tracks)
-                idx["xai_status"]["region_tracks"] = "computed"
-            except Exception as e:
-                idx["xai_status"]["region_tracks"] = "failed"
-                idx["xai_errors"]["region_tracks"] = str(e)
-                logger.exception("region tracking enrichment failed")
-
-            # Multi-signal fusion and frequency stats if we have the original video.
-            if video_src and os.path.isfile(video_src):
+            cam_raw = np.load(cam_volume_path)
+            cam, cam_shape_err = normalize_cam_volume(cam_raw)
+            if cam is None:
+                idx["xai_status"]["temporal_inconsistency"] = "skipped:bad_cam_shape"
+                idx["xai_status"]["region_tracks"] = "skipped:bad_cam_shape"
+                idx["xai_status"]["fusion"] = "skipped:bad_cam_shape"
+                idx["xai_status"]["video_frequency_stats"] = "skipped:bad_cam_shape"
+                idx["xai_errors"]["cam_shape"] = cam_shape_err
+            else:
+                # Persist normalized shape to avoid repeated failures on cache hits.
                 try:
-                    frames_gray, _ = prepare_gray_frames_from_video(video_src)
-                    T_cam = cam.shape[0]
-                    T_vid = frames_gray.shape[0]
-                    T_use = min(T_cam, T_vid)
-                    max_fusion_frames = int(idx.get("max_fusion_frames", 200)) if isinstance(idx.get("max_fusion_frames", None), int) else 200
-                    if T_use > max_fusion_frames:
-                        idx["xai_status"]["fusion"] = f"skipped:too_long:{T_use}>{max_fusion_frames}"
-                        idx["xai_status"]["video_frequency_stats"] = f"skipped:too_long:{T_use}>{max_fusion_frames}"
-                    else:
-                        cam_use = cam[:T_use]
-                        frames_use_full = frames_gray[:T_use]
-                        T_use, Hc, Wc = cam_use.shape
-                        frames_use = np.zeros((T_use, Hc, Wc), dtype=frames_use_full.dtype)
-                        import cv2 as _cv2
+                    import numpy as np
 
-                        for t in range(T_use):
-                            frames_use[t] = _cv2.resize(
-                                frames_use_full[t],
-                                (Wc, Hc),
-                                interpolation=_cv2.INTER_AREA,
-                            )
+                    np.save(cam_volume_path, cam)
+                except Exception:
+                    pass
 
-                        flow_err = compute_optical_flow_error(frames_use)
-                        freq_noise = compute_frequency_noise_map(frames_use)
-                        fused = generate_fused_heatmap(
-                            cam_use.astype(float), flow_err[:T_use], freq_noise[:T_use]
-                        )
+                # Temporal inconsistency
+                try:
+                    flat = cam.reshape(cam.shape[0], -1)
+                    delta_t = compute_temporal_inconsistency(flat)
+                    idx["temporal_inconsistency"] = delta_t.tolist()
+                    idx["xai_status"]["temporal_inconsistency"] = "computed"
+                except Exception as e:
+                    idx["xai_status"]["temporal_inconsistency"] = "failed"
+                    idx["xai_errors"]["temporal_inconsistency"] = str(e)
+                    logger.exception("temporal inconsistency enrichment failed")
+
+                # Region tracks
+                try:
+                    stride = max(1, int(region_track_stride))
+                    cam_tracks = cam[::stride] if stride > 1 else cam
+                    masks = cam_to_binary_masks(cam_tracks)
+                    tracks = track_regions_iou(masks, cam_tracks)
+                    summary = summarize_region_anomalies(tracks)
+                    summary["track_stride"] = stride
+                    idx["region_tracks"] = summary
+                    idx["xai_status"]["region_tracks"] = "computed"
+                except Exception as e:
+                    idx["xai_status"]["region_tracks"] = "failed"
+                    idx["xai_errors"]["region_tracks"] = str(e)
+                    logger.exception("region tracking enrichment failed")
+
+                # Multi-signal fusion and frequency stats if we have the original video.
+                if video_src and os.path.isfile(video_src):
+                    try:
+                        frames_gray, _ = prepare_gray_frames_from_video(video_src)
+                        T_cam = cam.shape[0]
+                        T_vid = frames_gray.shape[0]
+                        T_use = min(T_cam, T_vid)
+                        max_frames = max(1, int(idx.get("max_fusion_frames", max_fusion_frames)))
+                        fused, freq_stats = compute_windowed_fusion(cam[:T_use], frames_gray[:T_use], max_frames)
                         idx["fused_heatmap_path"] = os.path.join(os.path.dirname(cam_volume_path), "fused_heatmap.npy")
                         np.save(idx["fused_heatmap_path"], fused)
-                        idx["xai_status"]["fusion"] = "computed"
-
-                        freq_stats = compute_frame_spectrum_stats(frames_use)
+                        idx["xai_status"]["fusion"] = "computed:windowed" if T_use > max_frames else "computed"
                         idx["video_frequency_stats"] = freq_stats
-                        idx["xai_status"]["video_frequency_stats"] = "computed"
-                except Exception as e:
-                    idx["xai_status"]["fusion"] = "failed"
-                    idx["xai_status"]["video_frequency_stats"] = "failed"
-                    idx["xai_errors"]["fusion"] = str(e)
-                    idx["xai_errors"]["video_frequency_stats"] = str(e)
-                    logger.exception("fusion/frequency enrichment failed")
-            else:
-                idx["xai_status"]["fusion"] = "skipped:no_video_src"
-                idx["xai_status"]["video_frequency_stats"] = "skipped:no_video_src"
+                        idx["xai_status"]["video_frequency_stats"] = "computed:windowed" if T_use > max_frames else "computed"
+                        idx["fusion_window_frames"] = max_frames
+                        idx["fusion_total_frames"] = T_use
+                    except Exception as e:
+                        idx["xai_status"]["fusion"] = "failed"
+                        idx["xai_status"]["video_frequency_stats"] = "failed"
+                        idx["xai_errors"]["fusion"] = str(e)
+                        idx["xai_errors"]["video_frequency_stats"] = str(e)
+                        logger.exception("fusion/frequency enrichment failed")
+                else:
+                    idx["xai_status"]["fusion"] = "skipped:no_video_src"
+                    idx["xai_status"]["video_frequency_stats"] = "skipped:no_video_src"
         else:
             idx["xai_status"]["temporal_inconsistency"] = "skipped:no_cam_volume"
             idx["xai_status"]["region_tracks"] = "skipped:no_cam_volume"

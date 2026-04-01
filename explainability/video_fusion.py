@@ -76,11 +76,17 @@ def compute_optical_flow_error(frames_gray: np.ndarray, smooth_window: int = 5) 
         mags[t] = mag
 
     # Smooth over time to estimate baseline motion, then subtract.
+    # Use explicit rolling mean to keep output length exactly (T-1),
+    # including short sequences where convolution "same" can be ambiguous.
     mags_flat = mags.reshape(T - 1, -1)
-    kernel = np.ones(smooth_window) / smooth_window
-    baseline = np.apply_along_axis(
-        lambda v: np.convolve(v, kernel, mode="same"), axis=0, arr=mags_flat
-    ).reshape(T - 1, H, W)
+    k = max(1, int(smooth_window))
+    left = k // 2
+    right = k - 1 - left
+    padded = np.pad(mags_flat, ((left, right), (0, 0)), mode="edge")
+    baseline_flat = np.empty_like(mags_flat)
+    for i in range(T - 1):
+        baseline_flat[i] = padded[i : i + k].mean(axis=0)
+    baseline = baseline_flat.reshape(T - 1, H, W)
     err = np.maximum(0.0, mags - baseline)
     # Pad first frame with zeros.
     flow_err = np.zeros((T, H, W), dtype=float)

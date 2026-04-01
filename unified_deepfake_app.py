@@ -24,6 +24,10 @@ from config import (
     AVH_MEAN_FACE,
     AVH_AVHUBERT_CKPT,
     AVH_GRADCAM_SCRIPT,
+    GRADCAM_DEFAULT_MAX_FUSION_FRAMES,
+    GRADCAM_DEFAULT_REGION_TRACK_STRIDE,
+    GRADCAM_DEFAULT_SELECTION_MODE,
+    GRADCAM_DEFAULT_MIN_TEMPORAL_GAP,
 )
 
 from detectors.avh_align import (
@@ -1401,6 +1405,40 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
             step=1,
             disabled=not run_forensics_cam,
         )
+        forensics_selection_mode = st.selectbox(
+            "Grad-CAM frame selection mode",
+            options=["top_k", "diverse_topk", "temporal_peaks"],
+            index=["top_k", "diverse_topk", "temporal_peaks"].index(GRADCAM_DEFAULT_SELECTION_MODE),
+            disabled=not run_forensics_cam,
+            help="top_k: strongest frames only; diverse_topk: spread peaks; temporal_peaks: local maxima with spacing.",
+        )
+        forensics_min_temporal_gap = st.slider(
+            "Min temporal gap (frames)",
+            min_value=1,
+            max_value=120,
+            value=int(GRADCAM_DEFAULT_MIN_TEMPORAL_GAP),
+            step=1,
+            disabled=not run_forensics_cam or forensics_selection_mode == "top_k",
+            help="Used by diverse_topk and temporal_peaks to avoid clustered overlays.",
+        )
+        forensics_max_fusion_frames = st.slider(
+            "Fusion window size (frames)",
+            min_value=50,
+            max_value=800,
+            value=int(GRADCAM_DEFAULT_MAX_FUSION_FRAMES),
+            step=10,
+            disabled=not run_forensics_cam,
+            help="Long videos are processed in windows of this size for flow/frequency fusion.",
+        )
+        region_track_stride = st.slider(
+            "Region track stride",
+            min_value=1,
+            max_value=12,
+            value=int(GRADCAM_DEFAULT_REGION_TRACK_STRIDE),
+            step=1,
+            disabled=not run_forensics_cam,
+            help="Use >1 to track every Nth frame on long videos for speed and stability.",
+        )
         run_robustness_delta = st.checkbox(
             "Also compute robustness delta (requires feature-adversary checkpoint)",
             value=False,
@@ -1440,6 +1478,10 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                         python_exe=avh_python_path,
                         run_forensics_cam=run_forensics_cam,
                         forensics_top_k=forensics_top_k,
+                        forensics_selection_mode=forensics_selection_mode,
+                        forensics_min_temporal_gap=forensics_min_temporal_gap,
+                        forensics_max_fusion_frames=forensics_max_fusion_frames,
+                        region_track_stride=region_track_stride,
                         run_robustness_delta=run_robustness_delta,
                         adv_ckpt_path=adv_ckpt_path,
                         capture_attention=capture_attention,

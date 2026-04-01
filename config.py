@@ -42,6 +42,12 @@ AVH_AVHUBERT_CKPT = os.path.join(AVH_AVHUBERT_DIR, "self_large_vox_433h.pt")
 # Grad-CAM evidence script
 AVH_GRADCAM_SCRIPT = os.path.join(AVH_DIR, "gradcam_mouth_roi.py")
 
+# Grad-CAM / XAI defaults
+GRADCAM_DEFAULT_MAX_FUSION_FRAMES = 200
+GRADCAM_DEFAULT_REGION_TRACK_STRIDE = 1
+GRADCAM_DEFAULT_SELECTION_MODE = "top_k"
+GRADCAM_DEFAULT_MIN_TEMPORAL_GAP = 24
+
 # Allowed python executables for running AVH subprocesses.
 # This prevents arbitrary code execution via user-supplied `python_exe`.
 AVH_PYTHON_ALLOWLIST = [
