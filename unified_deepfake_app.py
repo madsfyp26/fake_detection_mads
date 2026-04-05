@@ -336,11 +336,18 @@ _py = (avh_python_path or "").strip()
 _py_ok = bool(_py and os.path.isfile(_py))
 st.sidebar.caption(f"{'✅' if _py_ok else '❌'} AVH Python path set and file exists")
 if not _avh_script_ok:
-    st.sidebar.caption(
-        "If this is fine **locally** but ❌ here: **`AVH/` is a Git submodule** — many hosts (incl. Streamlit Cloud) "
-        "deploy **without** submodule files. Commit `.gitmodules`, ensure `AVH` is public or use deploy keys, and "
-        "prefer `git clone --recurse-submodules`. Video AVH still needs a separate **conda `avh` Python** anyway."
-    )
+    with st.sidebar.expander("Why AVH shows ❌ on Streamlit Cloud"):
+        st.markdown(
+            """
+**Community Cloud does not clone Git submodules**, so `AVH/` is empty on deploy — committing `.gitmodules` does not fix that.
+
+**Full AVH video** also needs a **conda `avh` Python** (fairseq, etc.) on the machine; Cloud does not provide that.
+
+**On Cloud, use:** **Inference Demo → NOMA (audio)** and API-backed pages (Fact check, Research chat) with Secrets.
+
+**For AVH / Combined video:** run **locally** (`streamlit run unified_deepfake_app.py`) or deploy on a **VM / Docker** where you run `git submodule update --init --recursive` and install the conda env.
+            """.strip()
+        )
 _lf_opts = ["full", "mean", "audio_primary", "video_primary", "learned"]
 _env_lf = get_late_fusion_mode()
 _lf_default_idx = _lf_opts.index(_env_lf) if _env_lf in _lf_opts else 0
