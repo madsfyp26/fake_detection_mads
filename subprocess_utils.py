@@ -51,9 +51,12 @@ def run_subprocess_capture(
         stdout, stderr = p.communicate(timeout=timeout_s)
         return {"returncode": p.returncode, "stdout": stdout, "stderr": stderr, "timed_out": False}
     except subprocess.TimeoutExpired:
-        # Kill the whole process group.
+        # Kill the whole process group (Unix) or process tree (Windows).
         try:
-            os.killpg(p.pid, signal.SIGTERM)
+            if os.name == "nt":
+                p.kill()
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
         except Exception:
             pass
 
@@ -62,7 +65,10 @@ def run_subprocess_capture(
             stdout, stderr = p.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(p.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    p.kill()
+                else:
+                    os.killpg(p.pid, signal.SIGKILL)
             except Exception:
                 pass
             stdout, stderr = p.communicate()

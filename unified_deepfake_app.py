@@ -1,12 +1,25 @@
 """
-Unified Streamlit App: NOMA (Audio-Only) + AVH-Align (Audio-Visual) Deepfake Detection
-Panel-ready: interactive explanations, methodology, and live testing for both systems.
+Unified Streamlit App: multimodal deepfake screening (audio, video + visual frames)
+via NOMA (audio) and AVH-Align (audio-visual), plus optional multilingual UI and research chat.
 """
 
 import io
 import os
+import re
 import sys
 import tempfile
+from datetime import datetime, timezone
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(_ROOT, ".env"))
+except ImportError:
+    pass
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +27,7 @@ import altair as alt
 
 from config import (
     PROJECT_ROOT,
+    get_late_fusion_mode,
     NOMA_MODEL_CANDIDATES,
     AVH_DIR,
     AVH_TEST_SCRIPT,
@@ -24,10 +38,11 @@ from config import (
     AVH_MEAN_FACE,
     AVH_AVHUBERT_CKPT,
     AVH_GRADCAM_SCRIPT,
-    GRADCAM_DEFAULT_MAX_FUSION_FRAMES,
-    GRADCAM_DEFAULT_REGION_TRACK_STRIDE,
-    GRADCAM_DEFAULT_SELECTION_MODE,
-    GRADCAM_DEFAULT_MIN_TEMPORAL_GAP,
+    STREAMLIT_GRADCAM_TOP_K,
+    STREAMLIT_GRADCAM_MAX_FUSION_FRAMES,
+    STREAMLIT_GRADCAM_SELECTION_MODE,
+    STREAMLIT_GRADCAM_MIN_TEMPORAL_GAP,
+    STREAMLIT_GRADCAM_REGION_TRACK_STRIDE,
 )
 
 from detectors.avh_align import (
@@ -36,13 +51,23 @@ from detectors.avh_align import (
     run_avh_on_video,
     run_avh_unsupervised_on_video,
 )
-from detectors.noma import get_noma_model_path, run_noma_prediction
+from detectors.noma import (
+    get_noma_model_path,
+    get_noma_pipeline,
+    noma_p_fake_raw_confidence_and_preds_from_probas,
+    run_noma_prediction,
+    run_noma_prediction_with_features,
+)
 from evidence.exporter import zip_evidence_bundle
 from explainability.gradcam_avh import run_gradcam_mouth_roi
 from orchestrator.combined_runner import run_combined_avh_to_noma
-
-# Ensure repo root imports work for external modules.
-sys.path.insert(0, PROJECT_ROOT)
+from ui.streamlit_css import STREAMLIT_CUSTOM_CSS
+from ui.i18n import t
+from ui.video_manual_crop import (
+    get_saved_manual_rect,
+    prepare_video_with_optional_manual_crop,
+    render_manual_crop_ui,
+)
 
 # ─── Page config & CSS ────────────────────────────────────────────────────
 st.set_page_config(
@@ -52,56 +77,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-    .main-header { font-size: 2rem; font-weight: 700; color: #1e3a5f; margin-bottom: 0.5rem; }
-    .sub-header  { font-size: 1rem; color: #5a6c7d; margin-bottom: 1.5rem; }
-    .method-card { padding: 1rem 1.25rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid #2563eb; background: #f8fafc; }
-    .step-box    { padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 6px; background: #f1f5f9; font-size: 0.95rem; }
-    .metric-big  { font-size: 1.5rem; font-weight: 700; color: #0f172a; }
-    .stExpander  { border: 1px solid #e2e8f0; border-radius: 8px; }
-
-    /* Pipeline flow diagram */
-    .pipeline-flow {
-        display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
-        gap: 4px; margin: 1rem 0; padding: 1rem; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-        border-radius: 12px; border: 1px solid #bae6fd;
-    }
-    .flow-step {
-        padding: 0.6rem 1rem; border-radius: 10px; font-size: 0.85rem; font-weight: 600; text-align: center;
-        min-width: 80px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-    }
-    .flow-step.audio   { background: #3b82f6; color: white; }
-    .flow-step.process { background: #8b5cf6; color: white; }
-    .flow-step.ml      { background: #059669; color: white; }
-    .flow-step.output  { background: #dc2626; color: white; }
-    .flow-step.visual  { background: #ea580c; color: white; }
-    .flow-arrow        { font-size: 1.2rem; color: #64748b; }
-    .flow-label        { font-size: 0.7rem; color: #64748b; margin-top: 2px; }
-
-    /* Insight / concept cards */
-    .insight-row       { display: flex; gap: 1rem; margin: 1rem 0; flex-wrap: wrap; }
-    .insight-card {
-        flex: 1; min-width: 140px; padding: 1rem; border-radius: 10px; text-align: center;
-        background: white; border: 2px solid #e2e8f0; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-    }
-    .insight-card .icon { font-size: 1.8rem; margin-bottom: 0.4rem; }
-    .insight-card .title { font-weight: 700; color: #334155; font-size: 0.9rem; }
-    .insight-card .desc  { font-size: 0.8rem; color: #64748b; margin-top: 0.25rem; }
-
-    /* How it works timeline */
-    .timeline { margin: 1rem 0; padding-left: 1.5rem; border-left: 3px solid #3b82f6; }
-    .timeline-step {
-        position: relative; margin-bottom: 1rem; padding: 0.75rem 1rem; background: #f8fafc;
-        border-radius: 8px; border: 1px solid #e2e8f0; margin-left: 0.5rem;
-    }
-    .timeline-step::before {
-        content: ''; position: absolute; left: -1.6rem; top: 1rem; width: 12px; height: 12px;
-        background: #3b82f6; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 2px #3b82f6;
-    }
-    .timeline-step strong { color: #1e40af; }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(STREAMLIT_CUSTOM_CSS, unsafe_allow_html=True)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 def get_noma_model_path():
@@ -130,7 +106,7 @@ def _zip_evidence_bundle(
     *,
     input_video_path: str,
     input_video_name: str,
-    avh_score: float,
+    avh_score: float | None,
     audio_path: str,
     roi_path: str,
     cam_idx: dict | None,
@@ -156,41 +132,6 @@ def _zip_evidence_bundle(
         noma_df=noma_df,
     )
 
-    manifest = {
-        "input_video": {
-            "name": input_video_name,
-            "path": input_video_path,
-            "sha256": _sha256_file(input_video_path),
-        },
-        "avh": {
-            "score": float(avh_score),
-        },
-        "artifacts": {
-            "audio_wav_sha256": _sha256_file(audio_path) if audio_path and os.path.isfile(audio_path) else None,
-            "mouth_roi_mp4_sha256": _sha256_file(roi_path) if roi_path and os.path.isfile(roi_path) else None,
-        },
-        "gradcam": cam_idx or None,
-    }
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("manifest.json", json.dumps(manifest, indent=2))
-
-        if audio_path and os.path.isfile(audio_path):
-            z.write(audio_path, arcname="artifacts/audio.wav")
-        if roi_path and os.path.isfile(roi_path):
-            z.write(roi_path, arcname="artifacts/mouth_roi.mp4")
-        if overlays_dir and os.path.isdir(overlays_dir):
-            for fn in sorted(os.listdir(overlays_dir)):
-                if fn.lower().endswith(".png"):
-                    z.write(os.path.join(overlays_dir, fn), arcname=f"gradcam/overlays/{fn}")
-        if cam_idx:
-            z.writestr("gradcam/index.json", json.dumps(cam_idx, indent=2))
-
-        if noma_df is not None and not noma_df.empty:
-            z.writestr("noma/predictions.csv", noma_df.to_csv(index=False))
-
-    return buf.getvalue()
 
 def check_avh_setup():
     """Return list of (check_name, ok, detail) for AVH setup."""
@@ -198,28 +139,52 @@ def check_avh_setup():
     return _impl()
 
 
-def run_avh_on_video(video_path: str, timeout: int = 300, python_exe: str = None, keep_temp: bool = False):
+def run_avh_on_video(
+    video_path: str,
+    timeout: int = 300,
+    python_exe: str = None,
+    keep_temp: bool = False,
+    smart_crop: str = "auto",
+):
     """Run AVH test_video.py on a video file.
     Returns (success, score_or_error_message) or (success, score, audio_path) if keep_temp=True.
     python_exe: use this Python (e.g. conda env where AVH works) instead of current one.
     """
     from detectors.avh_align import run_avh_on_video as _impl
-    return _impl(video_path=video_path, timeout=timeout, python_exe=python_exe, keep_temp=keep_temp)
+    return _impl(
+        video_path=video_path,
+        timeout=timeout,
+        python_exe=python_exe,
+        keep_temp=keep_temp,
+        smart_crop=smart_crop,
+    )
 
 
-def run_avh_unsupervised_on_video(video_path: str, timeout: int = 300, python_exe: str = None, keep_temp: bool = False):
+def run_avh_unsupervised_on_video(
+    video_path: str,
+    timeout: int = 300,
+    python_exe: str = None,
+    keep_temp: bool = False,
+    smart_crop: str = "auto",
+):
     """
     Run unsupervised AVH scoring (no training) on a video.
     Returns (success, score_or_error) or (success, score, audio_path) if keep_temp=True.
     """
     from detectors.avh_align import run_avh_unsupervised_on_video as _impl
-    return _impl(video_path=video_path, timeout=timeout, python_exe=python_exe, keep_temp=keep_temp)
+    return _impl(
+        video_path=video_path,
+        timeout=timeout,
+        python_exe=python_exe,
+        keep_temp=keep_temp,
+        smart_crop=smart_crop,
+    )
 
 
 def run_gradcam_mouth_roi(
     video_path: str,
     python_exe: str,
-    top_k: int = 2,
+    top_k: int = STREAMLIT_GRADCAM_TOP_K,
     adv_ckpt: str = None,
     roi_path: str = None,
     audio_path: str = None,
@@ -243,25 +208,6 @@ def run_gradcam_mouth_roi(
     )
 
 
-def _get_readable_ckpt_path(path: str, tmp_name: str = "AVH-Align_AV1M.pt", force_tmp: bool = False):
-    """Return a path we can read. If original raises PermissionError, copy to /tmp.
-    If force_tmp, always copy to /tmp (for subprocess; avoids sandbox permission issues).
-    """
-    import shutil
-    tmp = os.path.join(tempfile.gettempdir(), tmp_name)
-    try:
-        with open(path, "rb") as f:
-            f.read(1)
-    except PermissionError:
-        shutil.copy2(path, tmp)
-        return tmp
-    if force_tmp:
-        if not os.path.isfile(tmp) or os.path.getsize(tmp) != os.path.getsize(path):
-            shutil.copy2(path, tmp)
-        return tmp
-    return path
-
-
 def run_avh_from_npz(npz_bytes: bytes, fusion_ckpt_path: str):
     """Score using only the Fusion checkpoint and pre-extracted .npz (no av_hubert/dlib).
     .npz must have keys 'visual' and 'audio' (arrays shape (T, 1024)). Returns (success, score_or_error).
@@ -270,13 +216,13 @@ def run_avh_from_npz(npz_bytes: bytes, fusion_ckpt_path: str):
     return _impl(npz_bytes=npz_bytes, fusion_ckpt_path=fusion_ckpt_path)
 
 
-def _show_avh_score_or_error(ok, result):
+def _show_avh_score_or_error(ok, result, *, use_unsup_avh: bool = False):
     """Render AVH score or error in Streamlit (reused for video and .npz paths)."""
     if ok:
         score = result
-        from calibration_runtime import avh_score_to_p_fake, get_uncertainty_margins
+        from calibration_runtime import avh_score_to_calibrated_p_fake, get_uncertainty_margins
 
-        p_fake = avh_score_to_p_fake(float(score))
+        p_fake = avh_score_to_calibrated_p_fake(float(score), use_unsup_avh=use_unsup_avh)
         avh_margin, _ = get_uncertainty_margins()
 
         if p_fake >= 0.5 + avh_margin:
@@ -291,7 +237,7 @@ def _show_avh_score_or_error(ok, result):
         <div style="padding:1.5rem; border-radius:12px; background:{score_bg}; border:3px solid {score_border}; text-align:center; margin:0.5rem 0;">
             <div style="font-size:2rem; font-weight:800; color:#0f172a;">{score:.4f}</div>
             <div style="font-size:0.95rem; font-weight:600; color:#475569; margin-top:0.25rem;">{score_label}</div>
-            <div style="font-size:0.8rem; color:#64748b; margin-top:0.5rem;">p(fake)={p_fake:.3f} from calibration</div>
+            <div style="font-size:0.8rem; color:#64748b; margin-top:0.5rem;">p(fake)={p_fake:.3f} ({'unsupervised' if use_unsup_avh else 'supervised'} calibration)</div>
         </div>
         """, unsafe_allow_html=True)
         if score_label == "Likely REAL":
@@ -308,7 +254,13 @@ def _show_avh_score_or_error(ok, result):
 
 # ─── Sidebar: module navigation ────────────────────────────────────────────
 st.sidebar.markdown("## 🛡️ Deepfake Detection Lab")
-st.sidebar.markdown("Full pipeline: dataset → preprocessing → features → models → XAI.")
+lang = st.sidebar.selectbox(
+    "Interface language / Idioma / भाषा",
+    options=["en", "es", "hi"],
+    format_func=lambda c: {"en": "English", "es": "Español", "hi": "हिन्दी"}[c],
+    key="ui_lang",
+)
+st.sidebar.markdown(t("sidebar_blurb", lang))
 page = st.sidebar.radio(
     "Select module",
     [
@@ -323,13 +275,18 @@ page = st.sidebar.radio(
         "Fusion & Custom Algorithms",
         "Evaluation & Metrics",
         "Final Combined Report",
+        "Fact check (STT + Serp + News)",
+        "Research chat",
     ],
     index=0,
 )
 use_unsup_avh = st.sidebar.checkbox(
     "Use unsupervised AVH (no training)",
-    value=True,
-    help="Zero-shot lip-audio mismatch score from AV-HuBERT features, no labeled training.",
+    value=not os.path.isfile(AVH_FUSION_CKPT),
+    help=(
+        "Zero-shot lip–audio mismatch score (no Fusion checkpoint training). "
+        "Uses a separate p(fake) mapping from supervised AVH — see calibration_runtime.avh_unsupervised_score_to_p_fake."
+    ),
 )
 # Resolved checkpoint paths (what the app uses)
 _noma_path = get_noma_model_path()
@@ -363,54 +320,240 @@ avh_python_path = st.sidebar.text_input(
     help="Must point to the avh conda env Python. The venv Python has wrong omegaconf and will fail.",
 )
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Runtime readiness**")
+_noma_ok = bool(_noma_path and os.path.isfile(_noma_path))
+st.sidebar.caption(f"{'✅' if _noma_ok else '❌'} NOMA model artifact")
+_avh_script_ok = os.path.isfile(AVH_TEST_SCRIPT)
+_avh_fusion_ok = os.path.isfile(AVH_FUSION_CKPT)
+_avh_hub_ok = os.path.isfile(AVH_AVHUBERT_CKPT)
+st.sidebar.caption(
+    f"{'✅' if _avh_script_ok else '❌'} AVH `test_video.py` · "
+    f"{'✅' if _avh_fusion_ok else '❌'} fusion ckpt · "
+    f"{'✅' if _avh_hub_ok else '❌'} AV-HuBERT ckpt"
+)
+_py = (avh_python_path or "").strip()
+_py_ok = bool(_py and os.path.isfile(_py))
+st.sidebar.caption(f"{'✅' if _py_ok else '❌'} AVH Python path set and file exists")
+_lf_opts = ["full", "mean", "audio_primary", "video_primary", "learned"]
+_env_lf = get_late_fusion_mode()
+_lf_default_idx = _lf_opts.index(_env_lf) if _env_lf in _lf_opts else 0
+with st.sidebar.expander("Combined pipeline", expanded=True):
+    combined_late_fusion_mode = st.selectbox(
+        "Late fusion mode",
+        options=_lf_opts,
+        index=_lf_default_idx,
+        key="sidebar_combined_late_fusion",
+        help=(
+            "**full** = reliability fusion (regime blend). Applies to **Inference Demo → Combined** runs. "
+            "Overrides `LATE_FUSION_MODE` for this session only."
+        ),
+    )
+with st.sidebar.expander("Readiness details", expanded=False):
+    try:
+        for name, ok, detail in check_avh_setup():
+            st.markdown(f"- **{name}:** {'OK' if ok else 'Missing'} — `{detail}`")
+    except Exception as e:
+        st.caption(f"Could not run full AVH check: {e}")
+
 # Session-state defaults for cross-page teaching/XAI flows.
 if "last_combined_res" not in st.session_state:
     st.session_state["last_combined_res"] = None
 if "last_cam_idx" not in st.session_state:
     st.session_state["last_cam_idx"] = None
+if "research_chat_messages" not in st.session_state:
+    st.session_state["research_chat_messages"] = []
 
-def _render_home_overview() -> None:
+
+def _streamlit_combined_persist_dir(video_name: str) -> str:
+    """Stable folder under eval_runs/streamlit_combined/ for Combined artifacts."""
+    safe = re.sub(r"[^\w.\-]+", "_", os.path.basename(video_name or "video").strip())[:80] or "video"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(PROJECT_ROOT, "eval_runs", "streamlit_combined")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, f"{ts}_{safe}")
+
+
+def _list_videos_in_dir(folder: str) -> list[str]:
+    if not folder or not os.path.isdir(folder):
+        return []
+    exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+    out: list[str] = []
+    for name in sorted(os.listdir(folder)):
+        p = os.path.join(folder, name)
+        if os.path.isfile(p) and os.path.splitext(name)[1].lower() in exts:
+            out.append(name)
+    return out
+
+
+def _safe_video_path_under_folder(folder: str, basename: str) -> str | None:
+    """Resolve a file under folder only (no path traversal)."""
+    try:
+        root = os.path.abspath(os.path.realpath(folder))
+        cand = os.path.abspath(os.path.join(root, basename))
+        if os.path.commonpath([root, cand]) != root:
+            return None
+    except (OSError, ValueError):
+        return None
+    return cand if os.path.isfile(cand) else None
+
+
+def _render_combined_limitations_expander(*, use_unsup_avh: bool) -> None:
+    """Shared copy for Combined results and Final Combined Report."""
+    with st.expander("Limitations and when to trust this", expanded=False):
+        st.markdown(
+            """
+            - **Not legal or sole proof** — screening / research aid only; expert review may still be required.
+            - **Face and audio quality** — poor lighting, heavy compression, small faces, or missing lips can skew AVH and Grad-CAM.
+            - **Dubbing / mismatch** — dialogue replaced after filming can look like a “fake” to lip–speech models even when the video is authentic.
+            - **Clip length** — shorter clips (e.g. under ~60s) are easier on CPU and RAM; long files take longer and may hit timeouts.
+            """
+        )
+        if use_unsup_avh:
+            st.caption(
+                "Unsupervised AVH is enabled: scores reflect zero-shot lip–audio mismatch, not the same training as supervised AVH-Align."
+            )
+        else:
+            st.caption(
+                "Supervised AVH-Align uses the fusion checkpoint; ensure checkpoints match the intended evaluation setting."
+            )
+
+
+def _render_combined_demo_summary_from_res(res: dict) -> None:
+    """Headline metrics after a successful Combined run (uses session result dict)."""
+    from calibration_runtime import avh_score_to_calibrated_p_fake
+    from config import get_late_fusion_mode
+
+    avh_score = res.get("avh_score")
+    avh_p_fake = res.get("p_avh_cal")
+    if avh_p_fake is None and isinstance(avh_score, (int, float)):
+        avh_p_fake = float(
+            avh_score_to_calibrated_p_fake(
+                float(avh_score),
+                use_unsup_avh=bool(res.get("use_unsup_avh")),
+            )
+        )
+    noma_df = res.get("noma_df")
+    noma_mean_p_fake = None
+    if isinstance(noma_df, pd.DataFrame) and "p_fake" in noma_df.columns and len(noma_df) > 0:
+        noma_mean_p_fake = float(noma_df["p_fake"].astype(float).mean())
+    p_fused = res.get("p_fused")
+    fusion_tension = res.get("fusion_tension")
+    fusion_verdict = res.get("fusion_verdict")
+    fusion_tau = res.get("fusion_tau")
+    late_mode = res.get("late_fusion_mode") or get_late_fusion_mode()
+
+    with st.container(border=True):
+        st.markdown(
+            '<p style="margin:0 0 0.5rem 0;font-weight:600;">Combined demo summary</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Late fusion (NOMA + AVH) mode: **{late_mode}** — set `LATE_FUSION_MODE` env to "
+            "`full` (default), `mean`, `audio_primary`, or `video_primary`."
+        )
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.metric("AVH p(fake)", f"{avh_p_fake:.3f}" if avh_p_fake is not None else "n/a")
+        with c2:
+            st.metric("NOMA mean p(fake)", f"{noma_mean_p_fake:.3f}" if noma_mean_p_fake is not None else "n/a")
+        with c3:
+            st.metric("Late-fused p(fake)", f"{float(p_fused):.3f}" if p_fused is not None else "n/a")
+        with c4:
+            st.metric(
+                "Fusion tension",
+                f"{float(fusion_tension):.3f}" if fusion_tension is not None else "n/a",
+            )
+        with c5:
+            st.metric(
+                "Fusion verdict",
+                str(fusion_verdict) if fusion_verdict else "n/a",
+            )
+        if p_fused is not None and fusion_tau is not None:
+            if late_mode == "full":
+                st.caption(
+                    "Reliability-weighted blend of calibrated AVH and mean NOMA p(fake); higher **tension** "
+                    "(|AVH − NOMA|) down-weights NOMA in the default blend. "
+                    f"Verdict bands use τ={float(fusion_tau):.3f} from calibration margins."
+                )
+            elif late_mode == "mean":
+                st.caption(
+                    f"**Simple mean:** p_fused = average of calibrated AVH and mean NOMA. "
+                    f"Verdict bands use τ={float(fusion_tau):.3f}."
+                )
+            elif late_mode == "audio_primary":
+                st.caption(
+                    f"**NOMA-primary:** p_fused follows mean NOMA p(fake). "
+                    f"Verdict bands use τ={float(fusion_tau):.3f}."
+                )
+            else:
+                st.caption(
+                    f"**AVH-primary:** p_fused follows calibrated AVH p(fake). "
+                    f"Verdict bands use τ={float(fusion_tau):.3f}."
+                )
+        else:
+            st.caption("Late fusion metrics populate after NOMA and calibration run in the same pipeline pass.")
+
+
+def _render_home_overview(lang: str) -> None:
     st.markdown('<p class="main-header">🛡️ Deepfake Detection Lab</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="sub-header">{t("home_subheader", lang)}</p>', unsafe_allow_html=True)
+    st.info(t("home_recommended", lang))
+    st.caption(t("home_disclaimer", lang))
     st.markdown(
-        '<p class="sub-header">End-to-end deepfake pipeline: from data and models to rich video/audio explainability.</p>',
-        unsafe_allow_html=True,
+        f"""
+{t("home_quickstart_title", lang)}
+1. {t("home_q1", lang)}
+2. {t("home_q2", lang)}
+3. {t("home_q3", lang)}
+        """
     )
-    with st.expander("📊 Comparison at a glance", expanded=True):
+    st.markdown(t("home_modality_note", lang))
+    with st.expander(t("home_expander_compare", lang), expanded=True):
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("""
+            st.markdown(
+                f"""
             <div style="padding:1rem; border-radius:10px; background:linear-gradient(180deg, #eff6ff 0%, #dbeafe 100%); border:2px solid #3b82f6;">
-                <div style="font-size:1.2rem; font-weight:700; color:#1e40af; margin-bottom:0.5rem;">🎧 NOMA</div>
-                <div style="font-size:0.85rem; color:#1e3a8a;">Audio-only · Lightweight</div>
+                <div style="font-size:1.2rem; font-weight:700; color:#1e40af; margin-bottom:0.5rem;">{t("home_noma_title", lang)}</div>
+                <div style="font-size:0.85rem; color:#1e3a8a;">{t("home_noma_sub", lang)}</div>
                 <ul style="margin:0.5rem 0 0 1rem; font-size:0.9rem;">
-                    <li>Input: WAV / MP3</li>
-                    <li>Detects: TTS, voice cloning</li>
-                    <li>Features + SVM → Real/Fake</li>
-                    <li>Fast (seconds)</li>
+                    <li>{t("home_noma_li1", lang)}</li>
+                    <li>{t("home_noma_li2", lang)}</li>
+                    <li>{t("home_noma_li3", lang)}</li>
+                    <li>{t("home_noma_li4", lang)}</li>
                 </ul>
             </div>
-            """, unsafe_allow_html=True)
+            """,
+                unsafe_allow_html=True,
+            )
         with c2:
-            st.markdown("""
+            st.markdown(
+                f"""
             <div style="padding:1rem; border-radius:10px; background:linear-gradient(180deg, #fef3c7 0%, #fde68a 100%); border:2px solid #f59e0b;">
-                <div style="font-size:1.2rem; font-weight:700; color:#b45309; margin-bottom:0.5rem;">🎬 AVH-Align</div>
-                <div style="font-size:0.85rem; color:#92400e;">Audio-visual · Deep learning</div>
+                <div style="font-size:1.2rem; font-weight:700; color:#b45309; margin-bottom:0.5rem;">{t("home_avh_title", lang)}</div>
+                <div style="font-size:0.85rem; color:#92400e;">{t("home_avh_sub", lang)}</div>
                 <ul style="margin:0.5rem 0 0 1rem; font-size:0.9rem;">
-                    <li>Input: Video (MP4)</li>
-                    <li>Detects: Lip–speech mismatch</li>
-                    <li>AV-HuBERT + Fusion → Score</li>
-                    <li>1–3 min (CPU)</li>
+                    <li>{t("home_avh_li1", lang)}</li>
+                    <li>{t("home_avh_li2", lang)}</li>
+                    <li>{t("home_avh_li3", lang)}</li>
+                    <li>{t("home_avh_li4", lang)}</li>
+                    <li>{t("home_avh_li5", lang)}</li>
                 </ul>
             </div>
-            """, unsafe_allow_html=True)
-        st.markdown("""
-        | | **NOMA** | **AVH-Align** |
-        |---|---|---|
-        | **Input** | Audio (WAV/MP3) | Video (MP4) with face + audio |
-        | **Detects** | Synthetic speech | Lip–speech mismatch |
-        | **Method** | Features + SVM | AV-HuBERT + Fusion MLP |
-        | **Output** | Per-second Real/Fake | Single score (higher = faker) |
-        """)
+            """,
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            f"""
+        {t("home_table_header", lang)}
+        {t("home_table_sep", lang)}
+        {t("home_table_r1", lang)}
+        {t("home_table_r2", lang)}
+        {t("home_table_r3", lang)}
+        {t("home_table_r4", lang)}
+        """
+        )
 
 
 def _render_teaching_block(problem: str, approach: str, algorithm: str, code_ref: str, output_notes: str, limitations: str):
@@ -509,7 +652,6 @@ def _render_feature_extraction_page() -> None:
     )
     if feat_upload is not None and noma_model_path:
         try:
-            from detectors.noma import run_noma_prediction_with_features
             _, _, feature_matrix, feature_names = run_noma_prediction_with_features(
                 noma_model_path,
                 audio_bytes=io.BytesIO(feat_upload.getvalue()),
@@ -557,6 +699,97 @@ def _render_model_training_page() -> None:
     )
 
 
+def _render_xai_gemini_expander(*, kind: str, res: dict | None, cam_idx: dict | None) -> None:
+    """Gemini walkthrough for Audio / Video Explainability pages."""
+    from integrations.research_chat.gemini_client import synthesize_ui_guide
+    from ui.report_explain_payload import XAI_SECTION_LABELS, build_xai_standalone_payload
+
+    payload = build_xai_standalone_payload(kind, res, cam_idx)
+    sid = "xai_audio" if kind == "audio" else "xai_video"
+    title = next(t for t in XAI_SECTION_LABELS if t[0] == sid)[1]
+    with st.expander("Gemini: explain this page (plots & metrics)", expanded=False):
+        st.caption(
+            "Uses **GEMINI_API_KEY** only. Answers use **simple English** plus a **technical** section on how CII / Grad-CAM are computed."
+        )
+        if st.button("Generate explanation", key=f"gemini_xai_btn_{kind}"):
+            with st.spinner("Asking Gemini…"):
+                text, err = synthesize_ui_guide(section_id=sid, section_title=title, guide_payload=payload)
+            st.session_state[f"xai_gemini_{kind}_text"] = text
+            st.session_state[f"xai_gemini_{kind}_err"] = err
+        if st.session_state.get(f"xai_gemini_{kind}_err"):
+            st.error(st.session_state[f"xai_gemini_{kind}_err"])
+        gtxt = st.session_state.get(f"xai_gemini_{kind}_text")
+        if gtxt:
+            st.markdown(gtxt)
+
+
+def _render_fact_check_page() -> None:
+    """Serp + News + Google Fact Check + Gemini; optional Gemini STT on uploaded audio."""
+    from integrations.research_chat.factcheck_turn import run_fact_check_with_optional_stt
+    from ui.env_keys_help import render_missing_data_api_keys_hint
+
+    st.markdown("## Fact check (sources + Gemini)")
+    st.caption(
+        "Type a **short claim** and/or upload **speech audio**. We transcribe with **Gemini** (STT), then query "
+        "**SerpAPI** (web), **NewsAPI**, and **Google Fact Check Tools**, and ask **Gemini** to map sources to "
+        "support / contradict / unclear. **Not legal proof** — APIs are incomplete and can miss context."
+    )
+    st.markdown(
+        "**Env:** `GEMINI_API_KEY` (required) · `SERPAPI_API_KEY` · `NEWS_API_KEY` · "
+        "`GOOGLE_FACT_CHECK_API_KEY` (optional but recommended for ClaimReview)."
+    )
+
+    claim = st.text_input("Claim to check (optional if you provide audio only)", key="fc_claim_text", placeholder="e.g. X won the 2024 election in region Y")
+    audio_fc = st.file_uploader("Optional: audio clip (speech) — WAV/MP3/OGG", type=["wav", "mp3", "ogg", "m4a"], key="fc_audio")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        n_serp = st.slider("Serp results", 3, 10, 6, key="fc_n_serp")
+    with c2:
+        n_news = st.slider("News articles", 3, 20, 10, key="fc_n_news")
+
+    if st.button("Run fact check", type="primary", key="fc_run"):
+        ab = audio_fc.getvalue() if audio_fc is not None else None
+        an = audio_fc.name if audio_fc is not None else None
+        with st.spinner("Transcribing (if audio) + fetching sources + synthesizing…"):
+            turn = run_fact_check_with_optional_stt(
+                claim_text=claim or None,
+                audio_bytes=ab,
+                audio_name=an,
+                num_serp=n_serp,
+                num_news=n_news,
+                num_factcheck=8,
+            )
+        st.session_state["fc_last_turn"] = turn
+
+    turn = st.session_state.get("fc_last_turn")
+    if turn is not None:
+        if getattr(turn, "stt_error", None):
+            st.warning(f"STT note: {turn.stt_error}")
+        if getattr(turn, "transcript", None):
+            st.markdown("#### Transcript (Gemini STT)")
+            st.code(turn.transcript or "", language=None)
+        if getattr(turn, "error", None) and not (turn.synthesis or "").strip():
+            st.error(turn.error)
+        if turn.synthesis:
+            st.markdown("#### Gemini verdict (source-grounded)")
+            st.markdown(turn.synthesis)
+        su = getattr(turn, "sources_used", {}) or {}
+        render_missing_data_api_keys_hint(su.get("errors"))
+        with st.expander("Sources (raw)", expanded=False):
+            if su.get("google_factcheck"):
+                st.markdown("**Google Fact Check (ClaimReview)**")
+                st.dataframe(pd.DataFrame(su["google_factcheck"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No Fact Check rows — set `GOOGLE_FACT_CHECK_API_KEY` or try a different claim wording.")
+            if su.get("serp"):
+                st.markdown("**Web (SerpAPI)**")
+                st.dataframe(pd.DataFrame(su["serp"]), use_container_width=True, hide_index=True)
+            if su.get("news"):
+                st.markdown("**News (NewsAPI)**")
+                st.dataframe(pd.DataFrame(su["news"]), use_container_width=True, hide_index=True)
+
+
 def _render_audio_xai_page() -> None:
     st.markdown("## Audio Explainability")
     _render_teaching_block(
@@ -587,6 +820,12 @@ def _render_audio_xai_page() -> None:
         st.info("Run Inference Demo → Combined first to populate CII and NOMA-side explanations.")
     st.caption("Spectrogram attribution and reconstruction-error overlays are scaffolded; model-specific hooks are pending.")
 
+    _render_xai_gemini_expander(
+        kind="audio",
+        res=st.session_state.get("last_combined_res"),
+        cam_idx=None,
+    )
+
 
 def _render_video_xai_page() -> None:
     st.markdown("## Video Explainability")
@@ -600,7 +839,21 @@ def _render_video_xai_page() -> None:
     )
     cam_idx = st.session_state.get("last_cam_idx")
     if not isinstance(cam_idx, dict):
-        st.info("No Grad-CAM evidence in session. Run Inference Demo → Combined with forensics enabled.")
+        st.info(
+            "**No Grad-CAM in this browser session yet.**\n\n"
+            "1. Sidebar → **Inference Demo** → **Combined (AVH → NOMA)**.\n"
+            "2. Leave **Include mouth ROI Grad-CAM** checked (default).\n"
+            "3. Set sidebar **Python for AVH video** to your `avh` conda Python.\n"
+            "4. Run Combined and wait for it to finish (Grad-CAM runs after AVH).\n\n"
+            "**Supervised vs unsupervised AVH:** both can produce Grad-CAM overlays — the vis path uses the "
+            "Fusion + AV-HuBERT stack; your sidebar choice only changes how the **lip–speech score** is computed.\n\n"
+            "If Combined shows a **Grad-CAM failed** warning, open it — usually wrong Python env, missing checkpoints, or timeout."
+        )
+        _render_xai_gemini_expander(
+            kind="video",
+            res=st.session_state.get("last_combined_res"),
+            cam_idx=None,
+        )
         return
 
     st.success("Loaded latest Grad-CAM evidence from session.")
@@ -665,6 +918,13 @@ def _render_video_xai_page() -> None:
         except Exception as e:
             st.caption(f"Could not load fused heatmap tensor: {e}")
 
+    _render_xai_gemini_expander(
+        kind="video",
+        res=st.session_state.get("last_combined_res"),
+        cam_idx=st.session_state.get("last_cam_idx"),
+    )
+
+
 def _render_fusion_algorithms_page() -> None:
     st.markdown("## Fusion & Custom Algorithms")
     _render_teaching_block(
@@ -703,7 +963,7 @@ def _render_evaluation_page() -> None:
         "Assess reliability and calibration quality.",
         "Show calibration, leakage audit, and available summary metrics.",
         "Offline evaluation scripts produce calibration and leakage artifacts.",
-        "calibration_fit.py, calibration_runtime.py, leakage_audit.py",
+        "tools/calibration_fit.py, calibration_runtime.py, tools/leakage_audit.py",
         "Available metric artifacts and quick-read summaries.",
         "Full benchmark metrics require curated eval datasets.",
     )
@@ -730,14 +990,83 @@ def _render_evaluation_page() -> None:
         st.info("No calibration_artifacts.json found yet.")
 
 
+def _render_research_chat_page(lang: str) -> None:
+    """Serp + Google Lens + News + Gemini; optional Combined-run context."""
+    from integrations.research_chat.chat_orchestrator import (
+        format_detection_context_from_combined,
+        run_research_turn,
+    )
+
+    st.markdown(t("research_title", lang))
+    st.caption(t("research_caption", lang))
+
+    has_combined = (
+        isinstance(st.session_state.get("last_combined_res"), dict)
+        and st.session_state["last_combined_res"].get("avh_ok")
+    )
+    include_combined = False
+    if has_combined:
+        include_combined = st.checkbox(
+            t("research_include_combined", lang),
+            value=True,
+            key="research_include_combined",
+            help=t("research_include_help", lang),
+        )
+
+    det_ctx = None
+    if include_combined and has_combined:
+        det_ctx = format_detection_context_from_combined(
+            st.session_state["last_combined_res"],
+            st.session_state.get("last_cam_idx"),
+        )
+
+    with st.expander(t("research_env_expander", lang), expanded=False):
+        st.markdown(t("research_env_md", lang))
+
+    show_src = st.checkbox(t("research_show_sources", lang), value=False, key="research_show_sources")
+
+    msgs = st.session_state["research_chat_messages"]
+    for m in msgs:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    if prompt := st.chat_input(t("research_chat_placeholder", lang)):
+        msgs.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Fetching sources and synthesizing…"):
+                turn = run_research_turn(
+                    prompt,
+                    detection_context=det_ctx if include_combined else None,
+                    history=msgs[:-1],
+                )
+            reply = (turn.text or turn.error or "No response.").strip()
+            st.markdown(reply)
+            if show_src and turn.sources_used:
+                with st.expander("Source fetch summary", expanded=False):
+                    st.json(
+                        {
+                            "errors": turn.sources_used.get("errors"),
+                            "serp_count": len(turn.sources_used.get("serp") or []),
+                            "google_lens_count": len(turn.sources_used.get("google_lens") or []),
+                            "news_count": len(turn.sources_used.get("news") or []),
+                        }
+                    )
+        msgs.append({"role": "assistant", "content": reply})
+
+    if msgs and st.button(t("research_clear", lang), key="research_clear_chat"):
+        st.session_state["research_chat_messages"] = []
+        st.rerun()
+
+
 def _render_final_combined_report_page() -> None:
-    st.markdown("## Final Combined Report")
     _render_teaching_block(
         "Produce a single forensic summary after Combined inference.",
         "Aggregate AVH score, NOMA timeline, video/audio XAI, and fusion diagnostics.",
         "Combine calibrated AVH and mean NOMA p(fake) into a blended risk score for triage.",
         "orchestrator/combined_runner.py + calibration_runtime.py + explainability/*",
-        "One-page verdict, signal cards, and downloadable JSON report.",
+        "Tabs: user summary, developer tables + Grad-CAM/fused heatmaps, Serp/Lens/News + Gemini.",
         "CMID may be unavailable until AVH embedding export is enabled.",
     )
     res = st.session_state.get("last_combined_res")
@@ -745,123 +1074,21 @@ def _render_final_combined_report_page() -> None:
         st.info("Run Inference Demo → Combined first to generate the final integrated report.")
         return
 
-    from calibration_runtime import avh_score_to_p_fake
+    from ui.integrated_verdict import render_integrated_final_report
 
-    avh_score = res.get("avh_score")
-    avh_p_fake = None
-    if isinstance(avh_score, (int, float)):
-        avh_p_fake = float(avh_score_to_p_fake(float(avh_score)))
-
-    nona_df = res.get("noma_df")
-    if nona_df is None:
-        nona_df = res.get("nona_df")
-    noma_mean_p_fake = None
-    noma_blocks = 0
-    if isinstance(nona_df, pd.DataFrame) and "p_fake" in nona_df.columns:
-        noma_blocks = int(len(nona_df))
-        if noma_blocks > 0:
-            noma_mean_p_fake = float(nona_df["p_fake"].astype(float).mean())
-
-    weights = {"avh": 0.55, "noma": 0.45}
-    blend_terms = []
-    if avh_p_fake is not None:
-        blend_terms.append((weights["avh"], avh_p_fake))
-    if noma_mean_p_fake is not None:
-        blend_terms.append((weights["noma"], noma_mean_p_fake))
-    blended_p_fake = None
-    if blend_terms:
-        w_sum = sum(w for w, _ in blend_terms)
-        blended_p_fake = float(sum(w * v for w, v in blend_terms) / max(w_sum, 1e-9))
-
-    verdict = "Insufficient evidence"
-    if blended_p_fake is not None:
-        if blended_p_fake >= 0.65:
-            verdict = "Likely FAKE"
-        elif blended_p_fake <= 0.35:
-            verdict = "Likely REAL"
-        else:
-            verdict = "Uncertain"
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("AVH p(fake)", f"{avh_p_fake:.3f}" if avh_p_fake is not None else "n/a")
-    with c2:
-        st.metric("NOMA mean p(fake)", f"{noma_mean_p_fake:.3f}" if noma_mean_p_fake is not None else "n/a")
-    with c3:
-        st.metric("Blended p(fake)", f"{blended_p_fake:.3f}" if blended_p_fake is not None else "n/a")
-    st.markdown(f"### Verdict: `{verdict}`")
-    st.caption("Blend formula: p_blend = weighted average of calibrated AVH and NOMA p(fake).")
-
-    if isinstance(nona_df, pd.DataFrame) and {"Seconds", "p_fake"}.issubset(set(nona_df.columns)):
-        st.markdown("#### NOMA timeline")
-        st.altair_chart(
-            alt.Chart(nona_df).mark_line().encode(x="Seconds:Q", y="p_fake:Q", tooltip=["Seconds", "p_fake"]),
-            use_container_width=True,
-        )
-        st.caption(f"Blocks analyzed: {noma_blocks}")
-
-    cam_idx = st.session_state.get("last_cam_idx")
-    if isinstance(cam_idx, dict):
-        st.markdown("#### Video XAI snapshot")
-        xai_status = cam_idx.get("xai_status") if isinstance(cam_idx.get("xai_status"), dict) else {}
-        xai_errors = cam_idx.get("xai_errors") if isinstance(cam_idx.get("xai_errors"), dict) else {}
-        st.json(
-            {
-                "cam_score": cam_idx.get("score"),
-                "temporal_status": xai_status.get("temporal_inconsistency", "unknown"),
-                "region_tracks_status": xai_status.get("region_tracks", "unknown"),
-                "fusion_status": xai_status.get("fusion", "unknown"),
-            }
-        )
-        if xai_errors:
-            st.caption("XAI failure reasons (if any):")
-            st.json(xai_errors)
-        if isinstance(cam_idx.get("cam_per_frame"), list):
-            cam_per = cam_idx["cam_per_frame"]
-            cdf = pd.DataFrame({"idx": list(range(len(cam_per))), "cam": cam_per})
-            st.altair_chart(alt.Chart(cdf).mark_line().encode(x="idx:Q", y="cam:Q"), use_container_width=True)
-
-    st.markdown("#### Fusion diagnostics")
-    st.markdown(f"- `cmid_status`: `{res.get('cmid_status', 'unknown')}`")
-    inst = res.get("noma_confidence_instability")
-    if isinstance(inst, dict):
-        st.markdown(f"- `CII`: `{float(inst.get('CII', 0.0)):.4e}`")
-
-    explanation = []
-    if avh_p_fake is not None:
-        explanation.append(f"AVH contributes p(fake)={avh_p_fake:.3f}")
-    if noma_mean_p_fake is not None:
-        explanation.append(f"NOMA contributes mean p(fake)={noma_mean_p_fake:.3f}")
-    if isinstance(inst, dict):
-        explanation.append(f"confidence instability CII={float(inst.get('CII', 0.0)):.4e}")
-    explanation_text = "; ".join(explanation) if explanation else "Signals unavailable."
-    st.markdown("#### Auto explanation")
-    st.info(f"{verdict}: {explanation_text}")
-
-    export_payload = {
-        "verdict": verdict,
-        "avh_score": avh_score,
-        "avh_p_fake": avh_p_fake,
-        "noma_mean_p_fake": noma_mean_p_fake,
-        "blended_p_fake": blended_p_fake,
-        "cmid_status": res.get("cmid_status"),
-        "cii": (float(inst.get("CII")) if isinstance(inst, dict) and inst.get("CII") is not None else None),
-    }
-    import json as _json
-
-    st.download_button(
-        "Download final_combined_report.json",
-        data=_json.dumps(export_payload, indent=2).encode("utf-8"),
-        file_name="final_combined_report.json",
-        mime="application/json",
-        key="download_final_combined_report",
+    render_integrated_final_report(
+        res=res,
+        cam_idx=st.session_state.get("last_cam_idx"),
+        lang=lang,
+        use_unsup_avh=use_unsup_avh,
+        render_limitations=_render_combined_limitations_expander,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  NOMA (Audio-Only) interface  → lives under "Inference Demo" module
 # ═══════════════════════════════════════════════════════════════════════════
 if page == "Home / Overview":
-    _render_home_overview()
+    _render_home_overview(lang)
 elif page == "Dataset Explorer":
     _render_dataset_explorer()
 elif page == "Preprocessing":
@@ -880,6 +1107,10 @@ elif page == "Evaluation & Metrics":
     _render_evaluation_page()
 elif page == "Final Combined Report":
     _render_final_combined_report_page()
+elif page == "Fact check (STT + Serp + News)":
+    _render_fact_check_page()
+elif page == "Research chat":
+    _render_research_chat_page(lang)
 
 # The existing NOMA / AVH / Combined controls are grouped under "Inference Demo".
 method = None
@@ -887,7 +1118,8 @@ if page == "Inference Demo":
     method = st.radio(
         "Detection method",
         ["NOMA (Audio-Only)", "AVH-Align (Audio-Visual)", "Combined (AVH → NOMA)"],
-        index=0,
+        index=2,
+        help="Combined is the recommended demo path (AVH lip–speech + NOMA audio + fused score).",
     )
 
 if page == "Inference Demo" and method == "NOMA (Audio-Only)":
@@ -984,8 +1216,6 @@ if page == "Inference Demo" and method == "NOMA (Audio-Only)":
                     try:
                         audio_bytes = io.BytesIO(upload.getvalue())
                         if show_noma_feature_sensitivity:
-                            from detectors.noma import run_noma_prediction_with_features
-
                             times, probas, feature_matrix, feature_names = run_noma_prediction_with_features(
                                 noma_model_path,
                                 audio_bytes=audio_bytes,
@@ -997,13 +1227,15 @@ if page == "Inference Demo" and method == "NOMA (Audio-Only)":
                                 audio_bytes=audio_bytes,
                                 audio_filename=upload.name,
                             )
-                        preds = probas.argmax(axis=1)
-                        confidences = probas.max(axis=1)
-                        p_fake = probas[:, 0]
+                        noma_pipe = get_noma_pipeline(noma_model_path)
+                        p_fake_raw, confidences, preds_str = noma_p_fake_raw_confidence_and_preds_from_probas(
+                            noma_pipe,
+                            probas,
+                        )
                         from calibration_runtime import noma_p_fake_to_calibrated
-                        p_fake = noma_p_fake_to_calibrated(p_fake)
+
+                        p_fake = noma_p_fake_to_calibrated(p_fake_raw)
                         p_real = 1.0 - p_fake
-                        preds_str = ["Fake" if i == 0 else "Real" for i in preds]
                         df = pd.DataFrame({
                             "Seconds": times,
                             "Prediction": preds_str,
@@ -1040,10 +1272,9 @@ if page == "Inference Demo" and method == "NOMA (Audio-Only)":
                         st.altair_chart(chart, width="stretch")
 
                         if show_noma_feature_sensitivity:
-                            from detectors.noma import get_noma_pipeline
                             from explainability.noma_feature_sensitivity import compute_noma_permutation_feature_sensitivity
 
-                            pipeline = get_noma_pipeline(noma_model_path)
+                            pipeline = noma_pipe
 
                             max_blocks_for_heatmap = 120
                             sens = compute_noma_permutation_feature_sensitivity(
@@ -1289,6 +1520,24 @@ elif page == "Inference Demo" and method == "AVH-Align (Audio-Visual)":
             upload_v = st.file_uploader("Upload a video file (MP4 with face + audio)", type=["mp4", "avi", "mov"], key="avh_upload")
             if upload_v is not None:
                 st.video(upload_v)
+            avh_smart_crop = st.selectbox(
+                "Spatial pre-crop (reels / on-screen text)",
+                options=["auto", "off", "reel", "face"],
+                index=3,
+                key="avh_smart_crop",
+                format_func=lambda m: {
+                    "auto": "Auto — face or vertical UI bands",
+                    "off": "Off — full frame before mouth ROI",
+                    "reel": "Vertical band — strip top/bottom captions",
+                    "face": "Face-focused (default) — dlib face box, then mouth ROI",
+                }.get(m, m),
+                help="Runs before AVH mouth detection: reduces caption/UI chrome on 9:16 clips and tightens on the speaker.",
+            )
+            render_manual_crop_ui(
+                state_prefix="avh",
+                file_bytes=upload_v.getvalue() if upload_v else None,
+                filename=upload_v.name if upload_v else None,
+            )
             if avh_python_path:
                 st.caption(f"Using Python: `{avh_python_path}`")
             else:
@@ -1302,22 +1551,37 @@ elif page == "Inference Demo" and method == "AVH-Align (Audio-Visual)":
                     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                         tmp.write(upload_v.getvalue())
                         tmp_path = tmp.name
+                    cropped_tmp = ""
+                    manual_r = get_saved_manual_rect("avh", upload_v.getvalue())
+                    path_avh, cropped_tmp, used_manual = prepare_video_with_optional_manual_crop(
+                        tmp_path, upload_v.name, manual_r
+                    )
+                    sc_use = "off" if used_manual else avh_smart_crop
+                    if manual_r and not used_manual:
+                        st.warning("Manual crop failed to encode; running on the full frame with automatic pre-crop.")
                     try:
                         with st.spinner("Running AVH pipeline (preprocess → AV-HuBERT → FusionModel). This may take 1–3 min on CPU…"):
                             if use_unsup_avh:
-                                ok, result = run_avh_unsupervised_on_video(tmp_path, timeout=900, python_exe=avh_python_path)
+                                ok, result = run_avh_unsupervised_on_video(
+                                    path_avh,
+                                    timeout=900,
+                                    python_exe=avh_python_path,
+                                    smart_crop=sc_use,
+                                )
                             else:
-                                ok, result = run_avh_on_video(tmp_path, timeout=900, python_exe=avh_python_path)
+                                ok, result = run_avh_on_video(
+                                    path_avh,
+                                    timeout=900,
+                                    python_exe=avh_python_path,
+                                    smart_crop=sc_use,
+                                )
                     except Exception as e:
                         ok, result = False, str(e)
-                    if use_unsup_avh and ok:
-                        st.markdown("#### 🎯 Unsupervised mismatch score")
-                        st.metric("Unsupervised score", f"{float(result):.4f}")
-                        st.caption("Higher score = stronger lip-audio mismatch evidence.")
-                    else:
-                        _show_avh_score_or_error(ok, result)
+                    _show_avh_score_or_error(ok, result, use_unsup_avh=use_unsup_avh)
                     try:
                         os.unlink(tmp_path)
+                        if cropped_tmp:
+                            os.unlink(cropped_tmp)
                     except Exception:
                         pass
             elif upload_v is None and not avh_full_ready:
@@ -1377,7 +1641,9 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
     st.markdown("### ▶️ Try Combined")
     st.markdown("""
     <div style="padding:1rem 1.25rem; border-radius:10px; background:linear-gradient(135deg,#fef3c7 0%,#fde68a 100%); border:1px solid #f59e0b; margin-bottom:1rem;">
-        Upload a video below. AVH runs first, then the extracted audio is sent to NOMA. Total time: ~2–4 min on CPU.
+        Upload a video <em>or</em> choose <strong>Local folder</strong> (defaults to <code>untitled folder 2</code>) and click <strong>Run Combined</strong>.
+        <strong>Visual proof:</strong> mouth ROI Grad-CAM — <em>~6 diverse key frames</em> by default (not hundreds).
+        <strong>Audio proof:</strong> NOMA per-second table + charts below. <strong>Fusion:</strong> sidebar <code>full</code> reliability blend.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1389,93 +1655,199 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
     elif not (avh_python_path and os.path.isfile(avh_python_path)):
         st.error("Set **Python for AVH video** in the sidebar to your avh conda Python.")
     else:
-        upload_combined = st.file_uploader("Upload a video (MP4 with face + audio)", type=["mp4", "avi", "mov"], key="combined_upload")
+        default_eval_folder = os.path.join(PROJECT_ROOT, "untitled folder 2")
+        video_source = st.radio(
+            "Video source",
+            ("Upload file", "Local folder on this machine"),
+            horizontal=True,
+            key="combined_video_source",
+            help="Pick **Local folder** to run on files under this repo (e.g. `untitled folder 2`) without re-uploading.",
+        )
+        upload_combined = None
+        local_folder_for_combined = default_eval_folder
+        local_pick_name: str | None = None
+        if video_source == "Upload file":
+            upload_combined = st.file_uploader(
+                "Upload a video (MP4 with face + audio)",
+                type=["mp4", "avi", "mov", "mkv", "webm"],
+                key="combined_upload",
+            )
+            if upload_combined is not None:
+                st.video(upload_combined)
+        else:
+            local_folder_for_combined = st.text_input(
+                "Folder containing videos",
+                value=default_eval_folder,
+                key="combined_local_folder",
+            )
+            _vids = _list_videos_in_dir(local_folder_for_combined)
+            if not _vids:
+                st.caption("No video files in that folder (expects .mp4, .mov, .avi, …).")
+            else:
+                local_pick_name = st.selectbox("Select a video", _vids, key="combined_local_pick")
+                _safe_prev = _safe_video_path_under_folder(
+                    local_folder_for_combined, local_pick_name or ""
+                )
+                if _safe_prev:
+                    st.video(_safe_prev)
+
+        file_bytes_for_crop: bytes | None = None
+        fname_for_crop: str | None = None
         if upload_combined is not None:
-            st.video(upload_combined)
-        run_forensics_cam = st.checkbox(
-            "Include mouth ROI Grad-CAM forensics evidence (optional)",
-            value=False,
-            help="Extra step: generates visual evidence overlays from the AV-HuBERT visual encoder."
+            file_bytes_for_crop = upload_combined.getvalue()
+            fname_for_crop = upload_combined.name
+        elif (
+            video_source == "Local folder on this machine"
+            and local_pick_name
+            and local_folder_for_combined
+        ):
+            _p_crop = _safe_video_path_under_folder(local_folder_for_combined, local_pick_name)
+            if _p_crop:
+                try:
+                    with open(_p_crop, "rb") as _cf:
+                        file_bytes_for_crop = _cf.read()
+                    fname_for_crop = local_pick_name
+                except OSError:
+                    file_bytes_for_crop = None
+
+        include_gradcam = st.checkbox(
+            "Include mouth ROI Grad-CAM (visual proof for the panel)",
+            value=True,
+            key="combined_include_gradcam",
+            help=(
+                f"Default saves **{STREAMLIT_GRADCAM_TOP_K}** diverse high-saliency frames (cap **{STREAMLIT_GRADCAM_MAX_FUSION_FRAMES}** fusion frames) — enough to review without hundreds of images. "
+                "Uncheck for AVH + NOMA scores only (faster). Uses Fusion + AV-HuBERT; needs sidebar **Python for AVH video**."
+            ),
         )
-        forensics_top_k = st.slider(
-            "Grad-CAM top-K frames",
-            min_value=1,
-            max_value=10,
-            value=2,
-            step=1,
-            disabled=not run_forensics_cam,
+        run_forensics_cam = bool(include_gradcam)
+
+        with st.expander("Optional manual crop (overrides automatic face crop)", expanded=True):
+            render_manual_crop_ui(
+                state_prefix="combined",
+                file_bytes=file_bytes_for_crop,
+                filename=fname_for_crop,
+            )
+
+        combined_smart_crop = st.selectbox(
+            "Spatial pre-crop before AVH (automatic face detect or bands)",
+            options=["auto", "off", "reel", "face"],
+            index=3,
+            key="combined_smart_crop",
+            format_func=lambda m: {
+                "auto": "Auto — try face crop, else vertical band on tall video",
+                "off": "Off — full frame",
+                "reel": "Vertical band only (strip captions)",
+                "face": "Face-focused (default) — largest face across sampled frames",
+            }.get(m, m),
+            help="Uses dlib frontal face detector in AVH smart_spatial_crop; manual crop above wins over this.",
         )
-        forensics_selection_mode = st.selectbox(
-            "Grad-CAM frame selection mode",
-            options=["top_k", "diverse_topk", "temporal_peaks"],
-            index=["top_k", "diverse_topk", "temporal_peaks"].index(GRADCAM_DEFAULT_SELECTION_MODE),
-            disabled=not run_forensics_cam,
-            help="top_k: strongest frames only; diverse_topk: spread peaks; temporal_peaks: local maxima with spacing.",
-        )
-        forensics_min_temporal_gap = st.slider(
-            "Min temporal gap (frames)",
-            min_value=1,
-            max_value=120,
-            value=int(GRADCAM_DEFAULT_MIN_TEMPORAL_GAP),
-            step=1,
-            disabled=not run_forensics_cam or forensics_selection_mode == "top_k",
-            help="Used by diverse_topk and temporal_peaks to avoid clustered overlays.",
-        )
-        forensics_max_fusion_frames = st.slider(
-            "Fusion window size (frames)",
-            min_value=50,
-            max_value=800,
-            value=int(GRADCAM_DEFAULT_MAX_FUSION_FRAMES),
-            step=10,
-            disabled=not run_forensics_cam,
-            help="Long videos are processed in windows of this size for flow/frequency fusion.",
-        )
-        region_track_stride = st.slider(
-            "Region track stride",
-            min_value=1,
-            max_value=12,
-            value=int(GRADCAM_DEFAULT_REGION_TRACK_STRIDE),
-            step=1,
-            disabled=not run_forensics_cam,
-            help="Use >1 to track every Nth frame on long videos for speed and stability.",
-        )
-        run_robustness_delta = st.checkbox(
-            "Also compute robustness delta (requires feature-adversary checkpoint)",
-            value=False,
-            disabled=not run_forensics_cam,
-            help="Uses your trained adversary generator to show how the AVH score changes under hard misalignment.",
-        )
-        capture_attention = st.checkbox(
-            "Capture transformer attention evidence (best-effort)",
-            value=False,
-            disabled=not run_forensics_cam,
-            help="Attempts to extract AV-HuBERT transformer attention weights and exports a per-time attention trace (may be slow and may fall back if attention weights are unavailable).",
-        )
-        adv_ckpt_path = st.text_input(
-            "Adversary checkpoint path (.pt)",
-            value="",
-            placeholder="/path/to/your/adversary/checkpoints/latest.pt",
-            disabled=not run_robustness_delta,
-        )
-        export_bundle = st.checkbox(
-            "Export evidence bundle (.zip) for panel",
-            value=False,
-            help="Creates a downloadable zip with hashes, extracted audio/ROI, Grad-CAM overlays, and NOMA predictions.",
-        )
-        if st.button("Run Combined (AVH → NOMA)", key="combined_btn") and upload_combined is not None:
-            suffix = os.path.splitext(upload_combined.name)[-1] or ".mp4"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(upload_combined.getvalue())
-                tmp_path = tmp.name
+
+        with st.expander("Advanced options (optional)", expanded=False):
+            st.caption(
+                f"Panel defaults are set in `config.py`: **{STREAMLIT_GRADCAM_TOP_K}** Grad-CAM overlays, "
+                f"**{STREAMLIT_GRADCAM_MAX_FUSION_FRAMES}** max fusion frames, selection **{STREAMLIT_GRADCAM_SELECTION_MODE}**, "
+                f"min gap **{STREAMLIT_GRADCAM_MIN_TEMPORAL_GAP}**."
+            )
+            export_bundle = st.checkbox(
+                "Download evidence .zip (extracted audio, mouth ROI, Grad-CAM PNGs if enabled)",
+                value=False,
+                key="combined_export_bundle",
+            )
+            dump_embeddings_for_cmid = st.checkbox(
+                "Cross-modal proof: dump AVH embeddings for **CMID** (slower; supervised AVH only)",
+                value=False,
+                disabled=use_unsup_avh,
+                key="combined_dump_emb",
+            )
+            noma_perm_max_blocks = st.slider(
+                "NOMA permutation sensitivity (extra audio proof; 0 = off)",
+                min_value=0,
+                max_value=60,
+                value=0,
+                key="combined_noma_perm",
+            )
+            persist_combined_artifacts = st.checkbox(
+                "Persist run to **eval_runs/streamlit_combined/** (stable audio, ROI, Grad-CAM; survives refresh)",
+                value=True,
+                key="combined_persist_disk",
+                help="Copies artifacts out of temp dirs and rewrites paths in session so Final Combined Report / Video Explainability keep working.",
+            )
+            cleanup_after_persist = st.checkbox(
+                "Delete temp folders after persist (recommended; frees disk)",
+                value=True,
+                key="combined_cleanup_temp",
+                disabled=not persist_combined_artifacts,
+                help="Only deletes paths under the system temp directory; requires persist enabled.",
+            )
+
+        # Grad-CAM / XAI: Streamlit panel defaults (compact overlays + audio NOMA table from same run).
+        forensics_top_k = int(STREAMLIT_GRADCAM_TOP_K)
+        forensics_selection_mode = str(STREAMLIT_GRADCAM_SELECTION_MODE)
+        forensics_min_temporal_gap = int(STREAMLIT_GRADCAM_MIN_TEMPORAL_GAP)
+        forensics_max_fusion_frames = int(STREAMLIT_GRADCAM_MAX_FUSION_FRAMES)
+        region_track_stride = int(STREAMLIT_GRADCAM_REGION_TRACK_STRIDE)
+        run_robustness_delta = False
+        adv_ckpt_path = ""
+        capture_attention = False
+        _can_run_combined = False
+        if upload_combined is not None:
+            _can_run_combined = True
+        elif video_source == "Local folder on this machine" and local_pick_name:
+            _can_run_combined = bool(
+                _safe_video_path_under_folder(local_folder_for_combined, local_pick_name)
+            )
+
+        if st.button("Run Combined (AVH → NOMA)", key="combined_btn") and _can_run_combined:
+            tmp_path: str | None = None
+            video_name_run = ""
+            source_for_prepare = ""
+
+            if upload_combined is not None:
+                suffix = os.path.splitext(upload_combined.name)[-1] or ".mp4"
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(upload_combined.getvalue())
+                    tmp_path = tmp.name
+                video_name_run = upload_combined.name
+                source_for_prepare = tmp_path
+            else:
+                _local_abs = _safe_video_path_under_folder(
+                    local_folder_for_combined, local_pick_name or ""
+                )
+                if not _local_abs:
+                    st.error("Could not resolve a safe path under the selected folder.")
+                    st.stop()
+                source_for_prepare = _local_abs
+                video_name_run = local_pick_name or "video.mp4"
+
+            cropped_tmp = ""
+            manual_r = get_saved_manual_rect("combined", file_bytes_for_crop)
+            path_avh, cropped_tmp, used_manual = prepare_video_with_optional_manual_crop(
+                source_for_prepare, video_name_run, manual_r
+            )
+            sc_combined = "off" if used_manual else combined_smart_crop
+            if manual_r and not used_manual:
+                st.warning("Manual crop failed to encode; running on the full frame with automatic pre-crop.")
 
             cam_parent_dir = None
             try:
-                with st.spinner("Running Combined pipeline (AVH → optional Grad-CAM → NOMA)…"):
+                _persist_dir = None
+                _cleanup_volatile = False
+                if st.session_state.get("combined_persist_disk", True):
+                    _persist_dir = _streamlit_combined_persist_dir(video_name_run)
+                    _cleanup_volatile = bool(st.session_state.get("combined_cleanup_temp", True))
+                with st.status("Running Combined pipeline (AVH → NOMA)…", expanded=True) as _combined_status:
+                    _combined_status.write(
+                        "AVH → optional Grad-CAM (~6 diverse ROI frames) → NOMA on extracted audio → "
+                        "calibrated reliability fusion. A few minutes on CPU is normal."
+                    )
+                    if _persist_dir:
+                        _combined_status.write(f"Persist dir: `{_persist_dir}`")
                     res = run_combined_avh_to_noma(
-                        video_path=tmp_path,
-                        video_name=upload_combined.name,
+                        video_path=path_avh,
+                        video_name=video_name_run,
                         use_unsup_avh=use_unsup_avh,
                         python_exe=avh_python_path,
+                        smart_crop=sc_combined,
                         run_forensics_cam=run_forensics_cam,
                         forensics_top_k=forensics_top_k,
                         forensics_selection_mode=forensics_selection_mode,
@@ -1488,10 +1860,22 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                         export_bundle=export_bundle,
                         noma_model_path=noma_model_path,
                         timeout=900,
+                        persist_run_dir=_persist_dir,
+                        cleanup_volatile_after_persist=_cleanup_volatile,
+                        dump_embeddings_for_cmid=dump_embeddings_for_cmid,
+                        noma_permutation_max_blocks=(
+                            int(noma_perm_max_blocks) if noma_perm_max_blocks > 0 else None
+                        ),
+                        late_fusion_mode=combined_late_fusion_mode,
                     )
                     st.session_state["last_combined_res"] = res
-                    if isinstance(res, dict) and isinstance(res.get("cam_idx"), dict):
-                        st.session_state["last_cam_idx"] = res.get("cam_idx")
+                    # Always sync Grad-CAM index: clear stale session when CAM is off or failed.
+                    _ci = res.get("cam_idx") if isinstance(res, dict) else None
+                    st.session_state["last_cam_idx"] = _ci if isinstance(_ci, dict) else None
+                    _combined_status.update(label="Combined pipeline finished", state="complete")
+
+                if isinstance(res, dict) and res.get("persist_run_dir"):
+                    st.caption(f"Artifacts persisted under: `{res['persist_run_dir']}`")
 
                 if res["avh_ok"]:
                     avh_score = res["avh_score"]
@@ -1501,6 +1885,12 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                         )
                     else:
                         st.success(f"**AVH score:** {avh_score:.4f} (higher = more likely fake)")
+
+                    _render_combined_demo_summary_from_res(res)
+                    st.info(
+                        "For a one-page summary and **Download final_combined_report.json**, open **Final Combined Report** in the sidebar."
+                    )
+                    _render_combined_limitations_expander(use_unsup_avh=use_unsup_avh)
 
                     if run_forensics_cam and res["cam_ok"] and res["cam_overlays_dir"]:
                         cam_parent_dir = res["cam_parent_dir"]
@@ -1652,16 +2042,88 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                         for f in sorted(overlay_files):
                             st.image(os.path.join(overlays_dir, f), caption=f)
                     elif run_forensics_cam:
-                        st.warning(f"Grad-CAM failed: {res.get('cam_idx') if res.get('cam_idx') else 'unknown error'}")
+                        _cerr = res.get("cam_error") or "unknown error"
+                        st.warning(f"Grad-CAM failed — **Video Explainability** will stay empty until this succeeds. Details:\n\n{_cerr}")
 
-                    nona_df = res.get("noma_df")
-                    if nona_df is None:
-                        nona_df = res.get("nona_df")
-                    if nona_df is not None and not nona_df.empty:
+                    noma_df = res.get("noma_df")
+                    if noma_df is not None and not noma_df.empty:
                         st.markdown("#### 📈 NOMA per-second predictions")
-                        st.dataframe(nona_df, width="stretch", hide_index=True)
-                        fake_pct = 100 * (nona_df["Prediction"] == "Fake").mean()
+                        st.dataframe(noma_df, width="stretch", hide_index=True)
+                        fake_pct = 100 * (noma_df["Prediction"] == "Fake").mean()
                         st.caption(f"Overall: {fake_pct:.1f}% blocks predicted Fake, {100-fake_pct:.1f}% Real")
+
+                        if res.get("cmid_status") == "computed" and isinstance(res.get("cmid"), dict):
+                            cmid_d = res["cmid"]
+                            cmid_arr = cmid_d.get("cmid") or []
+                            if isinstance(cmid_arr, list) and len(cmid_arr) > 0:
+                                import statistics as _stats
+
+                                st.markdown("#### CMID (cross-modal embedding inconsistency)")
+                                st.caption(
+                                    f"Mean CMID={_stats.mean(float(x) for x in cmid_arr):.4f}, "
+                                    f"max={max(float(x) for x in cmid_arr):.4f} (requires embedding dump)."
+                                )
+
+                        tc = res.get("temporal_corroboration")
+                        if isinstance(tc, dict) and tc.get("status") == "ok":
+                            st.markdown("#### Multimodal corroboration (NOMA p(fake) vs video saliency, time-aligned)")
+                            c1, c2, c3 = st.columns(3)
+                            if res.get("tension_index") is not None:
+                                c1.metric(
+                                    "Tension |cal AVH − mean NOMA|",
+                                    f"{float(res['tension_index']):.3f}",
+                                )
+                            if tc.get("corroboration_rate") is not None:
+                                c2.metric("Corroboration rate", f"{float(tc['corroboration_rate']):.2f}")
+                            if tc.get("conflict_rate") is not None:
+                                c3.metric("Conflict rate", f"{float(tc['conflict_rate']):.2f}")
+                            st.caption(
+                                "Corroboration: high p(fake) and high saliency in the same second bin. "
+                                "Conflict: high p(fake) but low saliency (review suggested)."
+                            )
+                            bins = tc.get("bins") or []
+                            if bins:
+                                corr_df = pd.DataFrame(bins)
+                                base = alt.Chart(corr_df).encode(
+                                    alt.X("second:Q", title="Time (s)"),
+                                    tooltip=["second", "p_fake", "saliency", "corroboration", "conflict"],
+                                )
+                                line_p = base.mark_line(color="#2563eb").encode(
+                                    alt.Y("p_fake:Q", title="NOMA p(fake) (calibrated)")
+                                )
+                                line_s = base.mark_line(color="#ea580c").encode(
+                                    y=alt.Y(
+                                        "saliency:Q",
+                                        title="Video saliency (norm)",
+                                        axis=alt.Axis(orient="right"),
+                                    )
+                                )
+                                st.altair_chart(
+                                    (line_p + line_s).resolve_scale(y="independent"),
+                                    use_container_width=True,
+                                )
+                                corr_pts = corr_df[corr_df["corroboration"]]
+                                if not corr_pts.empty:
+                                    st.altair_chart(
+                                        alt.Chart(corr_pts)
+                                        .mark_circle(size=80, color="green")
+                                        .encode(x="second:Q", y="p_fake:Q", tooltip=["second", "p_fake"]),
+                                        use_container_width=True,
+                                    )
+
+                        perm = res.get("noma_permutation_xai")
+                        if isinstance(perm, dict):
+                            if perm.get("error"):
+                                st.warning(f"NOMA permutation XAI: {perm['error']}")
+                            elif perm.get("topk_per_block") is not None:
+                                st.markdown("#### NOMA permutation feature sensitivity (top drivers)")
+                                st.caption("Per-block top features by |Δ calibrated p(fake)| when shuffled across blocks.")
+                                st.json(
+                                    {
+                                        "topk_per_block": perm.get("topk_per_block", [])[:12],
+                                        "note": "Truncated display; full output in API result JSON.",
+                                    }
+                                )
 
                         # XAI: Confidence Instability Index over NOMA p(fake).
                         inst = res.get("noma_confidence_instability")
@@ -1672,7 +2134,7 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                             try:
                                 inst_df = pd.DataFrame(
                                     {
-                                        "Seconds": nona_df["Seconds"],
+                                        "Seconds": noma_df["Seconds"],
                                         "Variance": var,
                                     }
                                 )
@@ -1717,11 +2179,54 @@ elif page == "Inference Demo" and method == "Combined (AVH → NOMA)":
                     except Exception:
                         pass
                 try:
-                    os.unlink(tmp_path)
+                    if tmp_path:
+                        os.unlink(tmp_path)
+                    if cropped_tmp:
+                        os.unlink(cropped_tmp)
                 except Exception:
                     pass
-        elif upload_combined is None:
-            st.info("Upload a video above to run the combined pipeline.")
+        elif not _can_run_combined:
+            st.info("Upload a video, or choose **Local folder** and pick a file, then run the combined pipeline.")
+
+        st.markdown("---")
+        with st.expander("Test chat — Serp + Google Lens + News + Gemini", expanded=False):
+            st.caption("No video upload required. Uses the same API stack as **Research chat** (Serp + Lens + News + Gemini).")
+            from integrations.research_chat.chat_orchestrator import run_research_turn
+
+            q_test = st.text_area(
+                "Type a query to test external search + synthesis",
+                height=80,
+                key="combined_test_query",
+                placeholder="e.g. Verify headlines about synthetic media regulation in 2025",
+            )
+            if st.button("Run test query", key="combined_test_run"):
+                with st.spinner("Fetching Serp, Lens, News, Gemini…"):
+                    turn = run_research_turn((q_test or "").strip(), detection_context=None, history=[])
+                st.session_state["combined_test_turn"] = {
+                    "text": turn.text,
+                    "error": turn.error,
+                    "sources_used": turn.sources_used,
+                }
+            ct = st.session_state.get("combined_test_turn")
+            if isinstance(ct, dict) and (ct.get("text") or ct.get("error")):
+                if ct.get("error"):
+                    st.error(ct["error"])
+                else:
+                    st.markdown("**Gemini**")
+                    st.markdown(ct.get("text") or "")
+                su = ct.get("sources_used") or {}
+                if su.get("errors"):
+                    st.warning("Tool errors: " + "; ".join(su["errors"]))
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Serp rows", len(su.get("serp") or []))
+                with c2:
+                    st.metric("Lens rows", len(su.get("google_lens") or []))
+                with c3:
+                    st.metric("News rows", len(su.get("news") or []))
+                if st.button("Clear test results", key="combined_test_clear"):
+                    st.session_state.pop("combined_test_turn", None)
+                    st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**How to run (terminal)**")

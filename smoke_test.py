@@ -12,7 +12,12 @@ import tempfile
 import numpy as np
 import soundfile as sf
 
-from detectors.noma import get_noma_model_path, run_noma_prediction_with_features
+from detectors.noma import (
+    get_noma_model_path,
+    get_noma_pipeline,
+    noma_fake_proba_column_index,
+    run_noma_prediction_with_features,
+)
 
 
 def _make_tone(sec: float = 2.0, sr: int = 22050) -> str:
@@ -38,7 +43,9 @@ def main() -> None:
     finally:
         os.remove(p)
 
-    print(f"NOMA smoke: blocks={len(times)}, features={X.shape[1]}, first_p_fake={probas[0,0]:.4f}")
+    pipe = get_noma_pipeline(model_path)
+    fc = noma_fake_proba_column_index(pipe)
+    print(f"NOMA smoke: blocks={len(times)}, features={X.shape[1]}, first_p_fake={probas[0, fc]:.4f}")
 
 
 if __name__ == "__main__":

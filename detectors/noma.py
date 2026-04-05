@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from config import NOMA_MODEL_CANDIDATES, PROJECT_ROOT
+from config import NOMA_MODEL_CANDIDATES, PROJECT_ROOT, get_noma_fake_class_label
 from logging_utils import get_logger, log_timed
 from metrics import inc_counter, observe_latency_ms
 
@@ -16,11 +16,11 @@ from metrics import inc_counter, observe_latency_ms
 TARGET_SR = 22050
 BLOCK_SECONDS = 1.0
 EPS = 1e-9
-NOMA_FEATURE_IMPL_VERSION = 1
+NOMA_FEATURE_IMPL_VERSION = 2
 NOMA_CACHE_DIR = os.path.join(PROJECT_ROOT, ".cache", "noma")
 
 
-FEATURE_NAMES: tuple[str, ...] = (
+FEATURE_NAMES: list[str] = (
     ["Chroma", "RMS", "Centroid", "Bandwidth", "Rolloff", "ZCR", "Tonnetz", "Contrast"]
     + [f"MFCC{i}" for i in range(1, 21)]
     + [f"IMFCC{i}" for i in range(1, 14)]
@@ -65,6 +65,58 @@ def get_noma_pipeline(model_path: str) -> Any:
     return _load_noma_pipeline(model_path)
 
 
+def _final_estimator_classes(pipeline: Any) -> np.ndarray:
+    """Binary sklearn `classes_` in column order for `predict_proba`."""
+    if hasattr(pipeline, "steps"):
+        est = pipeline.steps[-1][1]
+    else:
+        est = pipeline
+    c = getattr(est, "classes_", None)
+    if c is None:
+        return np.array([0, 1], dtype=int)
+    return np.asarray(c)
+
+
+def noma_fake_proba_column_index(pipeline: Any) -> int:
+    """
+    Column index of P(fake) in `predict_proba`, using `classes_` and `get_noma_fake_class_label()`.
+    """
+    classes = _final_estimator_classes(pipeline)
+    fake_label = int(get_noma_fake_class_label())
+    idx = np.where(classes == fake_label)[0]
+    if idx.size != 1:
+        raise ValueError(
+            f"NOMA classes_={classes.tolist()} must contain fake label {fake_label} exactly once; "
+            "set NOMA_FAKE_CLASS_LABEL to 0 or 1 to match training."
+        )
+    return int(idx[0])
+
+
+def noma_p_fake_raw_confidence_and_preds_from_probas(
+    pipeline: Any,
+    probas: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """
+    Map raw sklearn `predict_proba` (n, 2) to p(fake) raw, max-proba confidence, and Fake/Real labels.
+
+    Uses `classes_` so argmax labels stay consistent when column 0 is Real and column 1 is Fake.
+    """
+    probas = np.asarray(probas, dtype=float)
+    if probas.ndim != 2 or probas.shape[1] != 2:
+        raise ValueError(f"Expected probas shape (n, 2), got {probas.shape}")
+    classes = _final_estimator_classes(pipeline)
+    fake_label = int(get_noma_fake_class_label())
+    fake_col = noma_fake_proba_column_index(pipeline)
+    p_fake_raw = probas[:, fake_col]
+    confidences = probas.max(axis=1)
+    win = probas.argmax(axis=1)
+    pred_labels = classes[win]
+    preds_str: list[str] = []
+    for pl in np.asarray(pred_labels).ravel():
+        preds_str.append("Fake" if int(pl) == fake_label else "Real")
+    return p_fake_raw, confidences, preds_str
+
+
 @lru_cache(maxsize=8)
 def _sha256_file_cached(path: str) -> str:
     import hashlib
@@ -82,47 +134,6 @@ def _sha256_bytes(bs: bytes) -> str:
     return h.hexdigest()
 
 
-def _ffmpeg_decode_to_wav(
-    *,
-    input_path: str,
-    target_sr: int = TARGET_SR,
-    timeout_s: int = 60,
-) -> str:
-    """
-    Decode any supported input into a mono WAV at `target_sr`.
-    Returns path to the decoded WAV (caller cleans it up).
-    """
-
-    import subprocess_utils
-
-    out_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    out_tmp_path = out_tmp.name
-    out_tmp.close()
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-loglevel",
-        "error",
-        "-i",
-        input_path,
-        "-ac",
-        "1",
-        "-ar",
-        str(target_sr),
-        "-vn",
-        "-f",
-        "wav",
-        out_tmp_path,
-    ]
-    ret = subprocess_utils.run_subprocess_capture(cmd, cwd=os.getcwd(), timeout_s=timeout_s)
-    if ret.get("timed_out"):
-        raise RuntimeError(f"ffmpeg decode timed out: {input_path}")
-    if ret.get("returncode") not in (0, None):
-        raise RuntimeError(f"ffmpeg decode failed: rc={ret.get('returncode')}\n{ret.get('stderr')}")
-    return out_tmp_path
-
-
 def _decode_audio_to_waveform(
     *,
     audio_path: str | None = None,
@@ -130,52 +141,19 @@ def _decode_audio_to_waveform(
     audio_filename: str | None = None,
     target_sr: int = TARGET_SR,
 ) -> np.ndarray:
-    """
-    Decode input audio into a mono waveform sampled at `target_sr`.
-    """
+    """Decode to mono float32 @ `target_sr` (single resample; see `detectors/audio_decode.py`)."""
+    from detectors.audio_decode import decode_audio_to_mono_float32
 
-    if not audio_path and audio_bytes is None:
-        raise ValueError("Provide either `audio_path` or `audio_bytes`.")
-
-    import librosa
-
-    input_tmp_path: str | None = None
-    wav_path: str | None = None
-
-    try:
-        if audio_path:
-            input_tmp_path = audio_path
-        else:
-            # We rely on the filename suffix for ffmpeg demuxing.
-            suffix = ".wav"
-            if audio_filename:
-                _, ext = os.path.splitext(audio_filename)
-                if ext:
-                    suffix = ext.lower()
-
-            in_tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            input_tmp_path = in_tmp.name
-            in_tmp.write(audio_bytes.getbuffer())
-            in_tmp.flush()
-            in_tmp.close()
-
-        wav_path = _ffmpeg_decode_to_wav(input_path=input_tmp_path, target_sr=target_sr)
-        y, _sr = librosa.load(wav_path, sr=target_sr, mono=True)
-        if y is None or len(y) == 0:
-            raise RuntimeError("Decoded waveform is empty.")
-        return np.asarray(y, dtype=np.float32)
-    finally:
-        # Clean only temporary paths we created.
-        if wav_path and os.path.isfile(wav_path):
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
-        if audio_path is None and input_tmp_path and os.path.isfile(input_tmp_path):
-            try:
-                os.remove(input_tmp_path)
-            except Exception:
-                pass
+    y = decode_audio_to_mono_float32(
+        audio_path=audio_path,
+        audio_bytes=audio_bytes,
+        audio_filename=audio_filename,
+        target_sr=int(target_sr),
+        timeout_s=600,
+    )
+    if y is None or len(y) == 0:
+        raise RuntimeError("Decoded waveform is empty.")
+    return np.asarray(y, dtype=np.float32)
 
 
 def _compute_imfcc(
@@ -204,6 +182,13 @@ def _extract_features_from_array(y: np.ndarray, *, sr: int = TARGET_SR) -> np.nd
     """
 
     import librosa
+
+    y = np.asarray(y, dtype=np.float32)
+    # Librosa STFT defaults use n_fft=2048; very short segments (edge clips / decode quirks)
+    # trigger warnings and unstable stats — pad to at least one full STFT window.
+    _min_win = 2048
+    if len(y) < _min_win:
+        y = np.pad(y, (0, _min_win - len(y)), mode="constant")
 
     # These come straight from `fake_audio_detection_pipeline.ipynb` reference code.
     chroma_stft = librosa.feature.chroma_stft(y=y, sr=sr)
@@ -293,7 +278,7 @@ def run_noma_prediction_with_features(
 
     Returns:
       times_seconds: (n_blocks,)
-      probas: (n_blocks, 2) in sklearn class order [Fake(0), Real(1)]
+      probas: (n_blocks, 2) sklearn `predict_proba` columns aligned with `pipeline.classes_`
       feature_matrix: (n_blocks, 41)
       feature_names: (41,)
     """

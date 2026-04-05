@@ -19,7 +19,7 @@ def zip_evidence_bundle(
     *,
     input_video_path: str,
     input_video_name: str,
-    avh_score: float,
+    avh_score: float | None,
     audio_path: str | None,
     roi_path: str | None,
     cam_idx: dict | None,
@@ -34,13 +34,14 @@ def zip_evidence_bundle(
     - Grad-CAM overlays + index.json
     - NOMA per-second predictions (csv)
     """
+    input_sha = _sha256_file(input_video_path) if input_video_path and os.path.isfile(input_video_path) else None
     manifest = {
         "input_video": {
             "name": input_video_name,
             "path": input_video_path,
-            "sha256": _sha256_file(input_video_path),
+            "sha256": input_sha,
         },
-        "avh": {"score": float(avh_score)},
+        "avh": {"score": float(avh_score) if avh_score is not None else None},
         "artifacts": {
             "audio_wav_sha256": _sha256_file(audio_path) if audio_path and os.path.isfile(audio_path) else None,
             "mouth_roi_mp4_sha256": _sha256_file(roi_path) if roi_path and os.path.isfile(roi_path) else None,

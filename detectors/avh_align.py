@@ -15,6 +15,8 @@ from config import (
     AVH_AVHUBERT_DIR,
 )
 
+from detectors.avh_ckpt_paths import get_readable_ckpt_path
+
 
 def check_avh_setup():
     """Return list of (check_name, ok, detail) for AVH setup."""
@@ -68,32 +70,14 @@ def check_avh_setup():
     return checks
 
 
-def _get_readable_ckpt_path(path: str, tmp_name: str = "AVH-Align_AV1M.pt", force_tmp: bool = False):
-    """
-    Return a path we can read in subprocesses.
-
-    If reading original checkpoint raises PermissionError, copy to /tmp.
-    If force_tmp is True, always copy to /tmp (work around sandbox/subprocess permission issues).
-    """
-    import shutil
-
-    tmp = os.path.join(tempfile.gettempdir(), tmp_name)
-    try:
-        with open(path, "rb") as f:
-            f.read(1)
-    except PermissionError:
-        shutil.copy2(path, tmp)
-        return tmp
-
-    if force_tmp:
-        if not os.path.isfile(tmp) or os.path.getsize(tmp) != os.path.getsize(path):
-            shutil.copy2(path, tmp)
-        return tmp
-
-    return path
-
-
-def run_avh_on_video(video_path: str, timeout: int = 300, python_exe: str | None = None, keep_temp: bool = False):
+def run_avh_on_video(
+    video_path: str,
+    timeout: int = 300,
+    python_exe: str | None = None,
+    keep_temp: bool = False,
+    dump_embeddings: bool = False,
+    smart_crop: str = "auto",
+):
     """
     Run AVH/test_video.py on a video file.
 
@@ -127,8 +111,8 @@ def run_avh_on_video(video_path: str, timeout: int = 300, python_exe: str | None
     except Exception as e:
         return (False, str(e), None) if keep_temp else (False, str(e))
 
-    fusion_path = _get_readable_ckpt_path(AVH_FUSION_CKPT, force_tmp=True)
-    avhubert_path = _get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
+    fusion_path = get_readable_ckpt_path(AVH_FUSION_CKPT, force_tmp=True)
+    avhubert_path = get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
 
     json_fd, json_out_path = tempfile.mkstemp(prefix="avh_score_", suffix=".json")
     os.close(json_fd)
@@ -146,6 +130,11 @@ def run_avh_on_video(video_path: str, timeout: int = 300, python_exe: str | None
     ]
     if keep_temp:
         cmd.append("--keep_temp")
+    if dump_embeddings:
+        cmd.append("--dump_embeddings")
+    sc = (smart_crop or "auto").strip().lower()
+    if sc in ("off", "auto", "reel", "face"):
+        cmd.extend(["--smart_crop", sc])
 
     try:
         run_res = run_subprocess_capture(cmd, cwd=AVH_DIR, timeout_s=timeout)
@@ -157,7 +146,10 @@ def run_avh_on_video(video_path: str, timeout: int = 300, python_exe: str | None
             return (False, err, None) if keep_temp else (False, err)
 
         if payload.get("success"):
-            score = float(payload.get("score"))
+            if payload.get("score") is None:
+                err = "AVH JSON missing score"
+                return (False, err, None) if keep_temp else (False, err)
+            score = float(payload["score"])
             if keep_temp:
                 return True, score, payload.get("audio_path")
             return True, score
@@ -176,6 +168,7 @@ def run_avh_unsupervised_on_video(
     timeout: int = 300,
     python_exe: str | None = None,
     keep_temp: bool = False,
+    smart_crop: str = "auto",
 ):
     """
     Run AVH/test_video_unsupervised.py on a video file.
@@ -200,7 +193,7 @@ def run_avh_unsupervised_on_video(
     except Exception as e:
         return (False, str(e), None) if keep_temp else (False, str(e))
 
-    avhubert_path = _get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
+    avhubert_path = get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
 
     json_fd, json_out_path = tempfile.mkstemp(prefix="avh_unsup_score_", suffix=".json")
     os.close(json_fd)
@@ -216,6 +209,9 @@ def run_avh_unsupervised_on_video(
     ]
     if keep_temp:
         cmd.append("--keep_temp")
+    sc = (smart_crop or "auto").strip().lower()
+    if sc in ("off", "auto", "reel", "face"):
+        cmd.extend(["--smart_crop", sc])
 
     try:
         run_res = run_subprocess_capture(cmd, cwd=AVH_DIR, timeout_s=timeout)
@@ -227,7 +223,10 @@ def run_avh_unsupervised_on_video(
             return (False, err, None) if keep_temp else (False, err)
 
         if payload.get("success"):
-            score = float(payload.get("score"))
+            if payload.get("score") is None:
+                err = "Unsupervised AVH JSON missing score"
+                return (False, err, None) if keep_temp else (False, err)
+            score = float(payload["score"])
             if keep_temp:
                 return True, score, payload.get("audio_path")
             return True, score
@@ -257,7 +256,7 @@ def run_avh_from_npz(npz_bytes: bytes, fusion_ckpt_path: str):
     if not os.path.isfile(fusion_ckpt_path):
         return False, f"Fusion checkpoint not found: {fusion_ckpt_path}"
 
-    ckpt_path = _get_readable_ckpt_path(fusion_ckpt_path)
+    ckpt_path = get_readable_ckpt_path(fusion_ckpt_path)
 
     sys.path.insert(0, AVH_DIR)
     try:

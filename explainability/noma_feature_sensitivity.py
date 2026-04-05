@@ -26,6 +26,7 @@ def compute_noma_permutation_feature_sensitivity(
     """
 
     from calibration_runtime import noma_p_fake_to_calibrated
+    from detectors.noma import noma_fake_proba_column_index
 
     if feature_matrix.ndim != 2:
         raise ValueError("feature_matrix must be 2D: (num_blocks, num_features).")
@@ -42,8 +43,9 @@ def compute_noma_permutation_feature_sensitivity(
         if block_times_seconds is not None:
             block_times_seconds = np.asarray(block_times_seconds, dtype=float)[idx]
 
+    fake_col = noma_fake_proba_column_index(pipeline)
     baseline_proba = pipeline.predict_proba(X)
-    p_fake_raw = baseline_proba[:, 0]
+    p_fake_raw = baseline_proba[:, fake_col]
     if use_calibrated_p_fake:
         p_fake_base = noma_p_fake_to_calibrated(p_fake_raw)
     else:
@@ -62,7 +64,7 @@ def compute_noma_permutation_feature_sensitivity(
         Xp[:, fi] = Xp[perm, fi]
 
         proba_perm = pipeline.predict_proba(Xp)
-        p_fake_raw_perm = proba_perm[:, 0]
+        p_fake_raw_perm = proba_perm[:, fake_col]
         if use_calibrated_p_fake:
             p_fake_perm = noma_p_fake_to_calibrated(p_fake_raw_perm)
         else:

@@ -42,11 +42,48 @@ AVH_AVHUBERT_CKPT = os.path.join(AVH_AVHUBERT_DIR, "self_large_vox_433h.pt")
 # Grad-CAM evidence script
 AVH_GRADCAM_SCRIPT = os.path.join(AVH_DIR, "gradcam_mouth_roi.py")
 
-# Grad-CAM / XAI defaults
+# Grad-CAM / XAI defaults (batch tools, gradcam_avh.py fallbacks)
 GRADCAM_DEFAULT_MAX_FUSION_FRAMES = 200
 GRADCAM_DEFAULT_REGION_TRACK_STRIDE = 1
 GRADCAM_DEFAULT_SELECTION_MODE = "top_k"
 GRADCAM_DEFAULT_MIN_TEMPORAL_GAP = 24
+
+# Streamlit Combined panel: compact, review-friendly (few strong overlays + spread in time)
+STREAMLIT_GRADCAM_TOP_K = 6
+STREAMLIT_GRADCAM_MAX_FUSION_FRAMES = 8
+STREAMLIT_GRADCAM_SELECTION_MODE = "diverse_topk"
+STREAMLIT_GRADCAM_MIN_TEMPORAL_GAP = 8
+STREAMLIT_GRADCAM_REGION_TRACK_STRIDE = 1
+
+# Late fusion: how to combine calibrated mean NOMA p(fake) with calibrated AVH p(fake).
+# full = reliability_fusion.py (default); mean / audio_primary / video_primary = simple rules.
+# learned = explainability/learned_reliability_fusion.py (params from calibration JSON or LEARNED_FUSION_PARAMS_PATH).
+LATE_FUSION_MODES = frozenset({"full", "mean", "audio_primary", "video_primary", "learned"})
+
+
+def get_noma_fake_class_label() -> int:
+    """
+    Sklearn class label used for Fake during NOMA training.
+
+    Mozilla / project notebook convention: 0 = Fake, 1 = Real. If your joblib was
+    trained with the opposite encoding, set env `NOMA_FAKE_CLASS_LABEL=1`.
+    """
+    raw = os.environ.get("NOMA_FAKE_CLASS_LABEL", "0").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        return 0
+    return 1 if v == 1 else 0
+
+
+def get_late_fusion_mode() -> str:
+    # Default `full` = explainability/reliability_fusion.py (regime-based blend).
+    # Override with LATE_FUSION_MODE=mean|audio_primary|video_primary for simpler rules.
+    raw = os.environ.get("LATE_FUSION_MODE", "full").strip().lower()
+    if raw in LATE_FUSION_MODES:
+        return raw
+    return "full"
+
 
 # Allowed python executables for running AVH subprocesses.
 # This prevents arbitrary code execution via user-supplied `python_exe`.
@@ -56,4 +93,14 @@ AVH_PYTHON_ALLOWLIST = [
     os.path.expanduser("~/miniconda3/envs/avh/bin/python"),
     os.path.expanduser("~/anaconda3/envs/avh/bin/python"),
 ]
+
+_extra_py = os.environ.get("AVH_PYTHON_ALLOWLIST_EXTRA", "")
+if _extra_py.strip():
+    for _chunk in _extra_py.replace(";", ",").split(","):
+        _p = _chunk.strip()
+        if _p and os.path.isfile(_p):
+            _ap = os.path.abspath(_p)
+            allow_abs = [os.path.abspath(x) for x in AVH_PYTHON_ALLOWLIST]
+            if _ap not in allow_abs:
+                AVH_PYTHON_ALLOWLIST.append(_ap)
 

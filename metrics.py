@@ -1,7 +1,6 @@
 from collections import defaultdict
 from typing import Dict, Tuple
 
-
 _counters: Dict[Tuple[str, str], int] = defaultdict(int)
 _latency_ms_sum: Dict[Tuple[str, str], float] = defaultdict(float)
 _latency_ms_count: Dict[Tuple[str, str], int] = defaultdict(int)

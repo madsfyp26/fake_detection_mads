@@ -1,4 +1,9 @@
+.env
 
 .cache/
+eval_runs/
 __pycache__/
 tmp_test/
+
+.DS_Store
+untitled folder 2/

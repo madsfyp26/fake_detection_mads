@@ -17,25 +17,7 @@ from config import (
 from logging_utils import get_logger, log_timed
 from metrics import inc_counter
 
-
-def _get_readable_ckpt_path(path: str, tmp_name: str = "AVH-Align_AV1M.pt", force_tmp: bool = False):
-    """Local copy of the checkpoint readability helper for Grad-CAM subprocess use."""
-    import shutil
-
-    tmp = os.path.join(tempfile.gettempdir(), tmp_name)
-    try:
-        with open(path, "rb") as f:
-            f.read(1)
-    except PermissionError:
-        shutil.copy2(path, tmp)
-        return tmp
-
-    if force_tmp:
-        if not os.path.isfile(tmp) or os.path.getsize(tmp) != os.path.getsize(path):
-            shutil.copy2(path, tmp)
-        return tmp
-
-    return path
+from detectors.avh_ckpt_paths import get_readable_ckpt_path
 
 
 @lru_cache(maxsize=16)
@@ -204,8 +186,8 @@ def run_gradcam_mouth_roi(
     try:
         import shutil
 
-        fusion_path = _get_readable_ckpt_path(AVH_FUSION_CKPT, force_tmp=True)
-        avhubert_path = _get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
+        fusion_path = get_readable_ckpt_path(AVH_FUSION_CKPT, force_tmp=True)
+        avhubert_path = get_readable_ckpt_path(AVH_AVHUBERT_CKPT, "self_large_vox_433h.pt", force_tmp=True)
 
         cmd = [
             py,
@@ -234,7 +216,7 @@ def run_gradcam_mouth_roi(
         if roi_path and audio_path:
             cmd += ["--roi_path", os.path.abspath(roi_path), "--audio_path", os.path.abspath(audio_path)]
         if adv_ckpt:
-            adv_path = _get_readable_ckpt_path(adv_ckpt, tmp_name="feature_adversary_latest.pt", force_tmp=True)
+            adv_path = get_readable_ckpt_path(adv_ckpt, tmp_name="feature_adversary_latest.pt", force_tmp=True)
             cmd += ["--adv_ckpt", adv_path]
         if keep_temp:
             cmd.append("--keep_temp")
@@ -247,7 +229,7 @@ def run_gradcam_mouth_roi(
         timed_out = bool(run_res.get("timed_out"))
         returncode = run_res.get("returncode")
 
-        if timed_out or (returncode not in (0, None)):
+        if timed_out or returncode != 0:
             return (False, out if out else "Grad-CAM timed out or failed.", None)
 
         index_path = os.path.join(out_dir, "index.json")

@@ -5,9 +5,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 class CustomNormalizer(BaseEstimator, TransformerMixin):
-    """
-    This class exist only to fit in pipeline format
-    """
+    """Sklearn-compatible normalizer wrapper around NormalizationTools."""
 
     def __init__(self, method="z-score"):
         self.method = method
