@@ -23,6 +23,10 @@ STRINGS: dict[str, dict[str, str]] = {
             "**Recommended path:** Sidebar → **Inference Demo** → **Combined (AVH → NOMA)** → optional **Final Combined Report** "
             "for a one-page JSON summary."
         ),
+        "home_upload_where": (
+            "**Looking for upload?** This page has none. Open the **sidebar** (top-left **≡** or **>** if it is collapsed) → "
+            "**Select module** → **Inference Demo** for audio/video uploads, or **Fact check** for speech audio + APIs."
+        ),
         "home_disclaimer": (
             "This app is a **screening / research aid** — not legal evidence, medical advice, or a substitute for expert review."
         ),
@@ -84,6 +88,10 @@ STRINGS: dict[str, dict[str, str]] = {
             "**Ruta recomendada:** barra lateral → **Inference Demo** → **Combined (AVH → NOMA)** → opcional **Final Combined Report** "
             "para un resumen JSON en una página."
         ),
+        "home_upload_where": (
+            "**¿Subir archivos?** Esta página no tiene cargadores. Abre la **barra lateral** (arriba a la izquierda **≡** o **>** si está plegada) → "
+            "**Select module** → **Inference Demo** (audio/vídeo) o **Fact check** (audio + APIs)."
+        ),
         "home_disclaimer": (
             "Esta app es una **ayuda de cribado / investigación** — no constituye prueba legal, consejo médico ni sustituto de revisión experta."
         ),
@@ -143,6 +151,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "home_recommended": (
             "**अनुशंसित:** साइडबार → **Inference Demo** → **Combined (AVH → NOMA)** → वैकल्पिक **Final Combined Report** "
             "एक पृष्ठ JSON सारांश के लिए।"
+        ),
+        "home_upload_where": (
+            "**अपलोड चाहिए?** इस पृष्ठ पर अपलोड नहीं है। **साइडबार** खोलें (ऊपर बाएँ **≡** या **>** अगर छिपा हो) → "
+            "**Select module** → **Inference Demo** (ऑडियो/वीडियो) या **Fact check** (भाषण ऑडियो + APIs)।"
         ),
         "home_disclaimer": (
             "यह ऐप **स्क्रीनिंग / शोध सहायक** है — कानूनी साक्ष्य, चिकित्सा सलाह या विशेषज्ञ समीक्षा का विकल्प नहीं।"

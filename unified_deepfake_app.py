@@ -335,6 +335,12 @@ st.sidebar.caption(
 _py = (avh_python_path or "").strip()
 _py_ok = bool(_py and os.path.isfile(_py))
 st.sidebar.caption(f"{'✅' if _py_ok else '❌'} AVH Python path set and file exists")
+if not _avh_script_ok:
+    st.sidebar.caption(
+        "If this is fine **locally** but ❌ here: **`AVH/` is a Git submodule** — many hosts (incl. Streamlit Cloud) "
+        "deploy **without** submodule files. Commit `.gitmodules`, ensure `AVH` is public or use deploy keys, and "
+        "prefer `git clone --recurse-submodules`. Video AVH still needs a separate **conda `avh` Python** anyway."
+    )
 _lf_opts = ["full", "mean", "audio_primary", "video_primary", "learned"]
 _env_lf = get_late_fusion_mode()
 _lf_default_idx = _lf_opts.index(_env_lf) if _env_lf in _lf_opts else 0
@@ -498,6 +504,7 @@ def _render_combined_demo_summary_from_res(res: dict) -> None:
 def _render_home_overview(lang: str) -> None:
     st.markdown('<p class="main-header">🛡️ Deepfake Detection Lab</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="sub-header">{t("home_subheader", lang)}</p>', unsafe_allow_html=True)
+    st.warning(t("home_upload_where", lang))
     st.info(t("home_recommended", lang))
     st.caption(t("home_disclaimer", lang))
     st.markdown(
